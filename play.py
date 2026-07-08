@@ -20,21 +20,34 @@ Controls:
     - While it's the model's turn, click one of your own pieces and then
       any other square (or drag-and-drop it) to queue a premove -- both
       squares light up solid blue, chess.com-style, with no destination
-      dots (a premove can target literally any square; only the real
-      legality once the model's move actually lands decides whether it
-      fires). It plays automatically the instant the model moves if
-      still legal, and is silently discarded otherwise. Click the
-      premoved piece again to cancel it.
+      dots (a premove can target literally any square, including a
+      square occupied by one of your own pieces -- handy for queuing a
+      recapture before the opponent's move that creates it even lands;
+      only the real legality once each of the model's moves actually
+      lands decides whether it fires). You can queue up several premoves
+      in a row: they fire one at a time, in order, one per model move,
+      and the moment any of them turns out illegal the rest of the queue
+      is discarded (same as chess.com). Click the start square of any
+      queued premove to cancel just that one.
     - Promoting a pawn pops up a small picker for Q/R/B/N (premove
       promotions default to queen).
     - Scroll with the mouse wheel over the sidebar to review earlier
       moves; it auto-follows the latest move again once a new move lands.
     - The "Eval Sidebar" toggle near the bottom of the right panel shows
-      or hides the eval bar.
+      or hides the eval bar. The "Analysis" button next to it opens a
+      full-window review of every move the model has made so far this
+      game -- its search's evaluation of the position and the top
+      candidate moves it considered (by search-visit share), alongside
+      the move it actually played. Press 'a' or Esc to toggle/close it,
+      and scroll with the mouse wheel while it's open.
     - When the game ends, a popup offers "Copy PGN" (copies the full game
       as PGN to your clipboard -- uses pyperclip if installed, else
-      pygame's own clipboard support) and "Rematch" (same as pressing 'r').
-    - Press 'r' after a game ends to start a new game (same settings).
+      pygame's own clipboard support) and "Rematch as White" / "Rematch
+      as Black" (start a new game playing the chosen color; pressing 'r'
+      repeats a same-color rematch).
+    - Press 'r' after a game ends to start a new game (same color).
+    - The window is resizable, and can be dragged to any size -- the
+      board/sidebar scale to fit. Press F11 to toggle fullscreen.
     - Press 'q' or close the window to quit.
 
 Sound effects (chess.com's default set) are loaded from --sounds
@@ -198,18 +211,35 @@ EVAL_TOGGLE_W, EVAL_TOGGLE_H = 46, 24
 EVAL_TOGGLE_RECT = pygame.Rect(SIDEBAR_X + SIDEBAR_W - 18 - EVAL_TOGGLE_W, WINDOW_H - 44,
                                 EVAL_TOGGLE_W, EVAL_TOGGLE_H)
 
-# End-of-game popup: centered over the whole window, with a "Copy PGN"
-# and a "Rematch" button.
-POPUP_W, POPUP_H = 420, 220
+# End-of-game popup: centered over the whole window, with "Copy PGN" and
+# "Analysis" side by side on the top row, and "Rematch as White" /
+# "Rematch as Black" side by side below them.
+POPUP_W, POPUP_H = 420, 270
 POPUP_RECT = pygame.Rect((WINDOW_W - POPUP_W) // 2, (WINDOW_H - POPUP_H) // 2, POPUP_W, POPUP_H)
 POPUP_BTN_W, POPUP_BTN_H = 170, 46
 POPUP_BTN_GAP = 20
-_popup_btn_y = POPUP_RECT.bottom - 30 - POPUP_BTN_H
-_popup_btn_total_w = POPUP_BTN_W * 2 + POPUP_BTN_GAP
-_popup_btn_x0 = POPUP_RECT.left + (POPUP_W - _popup_btn_total_w) // 2
-COPY_PGN_BTN_RECT = pygame.Rect(_popup_btn_x0, _popup_btn_y, POPUP_BTN_W, POPUP_BTN_H)
-REMATCH_BTN_RECT = pygame.Rect(_popup_btn_x0 + POPUP_BTN_W + POPUP_BTN_GAP, _popup_btn_y,
-                                POPUP_BTN_W, POPUP_BTN_H)
+POPUP_ROW_GAP = 14
+
+_popup_row2_y = POPUP_RECT.bottom - 30 - POPUP_BTN_H
+_popup_row1_y = _popup_row2_y - POPUP_ROW_GAP - POPUP_BTN_H
+_popup_row_total_w = POPUP_BTN_W * 2 + POPUP_BTN_GAP
+_popup_row_x0 = POPUP_RECT.left + (POPUP_W - _popup_row_total_w) // 2
+
+COPY_PGN_BTN_RECT = pygame.Rect(_popup_row_x0, _popup_row1_y, POPUP_BTN_W, POPUP_BTN_H)
+POPUP_ANALYSIS_BTN_RECT = pygame.Rect(_popup_row_x0 + POPUP_BTN_W + POPUP_BTN_GAP, _popup_row1_y,
+                                       POPUP_BTN_W, POPUP_BTN_H)
+REMATCH_WHITE_BTN_RECT = pygame.Rect(_popup_row_x0, _popup_row2_y, POPUP_BTN_W, POPUP_BTN_H)
+REMATCH_BLACK_BTN_RECT = pygame.Rect(_popup_row_x0 + POPUP_BTN_W + POPUP_BTN_GAP, _popup_row2_y,
+                                      POPUP_BTN_W, POPUP_BTN_H)
+
+# Sidebar "Analysis" button (opens the full-window move-analysis panel),
+# drawn next to the "Eval Sidebar" toggle at the bottom of the right
+# panel. Fixed screen-space rect, same rationale as EVAL_TOGGLE_RECT.
+ANALYSIS_BTN_W, ANALYSIS_BTN_H = 100, 26
+ANALYSIS_BTN_RECT = pygame.Rect(SIDEBAR_X + 18, WINDOW_H - 44 - 1, ANALYSIS_BTN_W, ANALYSIS_BTN_H)
+
+# Close ("X") button for the analysis overlay, top-right of the window.
+ANALYSIS_CLOSE_BTN_RECT = pygame.Rect(WINDOW_W - 50, 16, 34, 34)
 
 
 
@@ -319,7 +349,7 @@ def pixel_to_square(pos, flipped: bool):
 
 def draw_board(screen, board_bg, board, images, flipped, selected_square,
                legal_targets, last_move, dragging_square,
-               premove, premove_selected_square):
+               premoves, premove_selected_square):
     screen.blit(board_bg, (BOARD_X, 0))
 
     def tint(square, color):
@@ -334,9 +364,10 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
 
     # Premove highlighting: chess.com-style -- both squares filled blue,
     # no destination dots, whether still being chosen or already queued.
-    if premove is not None:
-        tint(premove[0], PREMOVE_TINT)
-        tint(premove[1], PREMOVE_TINT)
+    # Several premoves can be queued at once; all of them light up.
+    for from_sq, to_sq in premoves:
+        tint(from_sq, PREMOVE_TINT)
+        tint(to_sq, PREMOVE_TINT)
     if premove_selected_square is not None:
         tint(premove_selected_square, PREMOVE_TINT)
 
@@ -352,19 +383,19 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
             screen.blit(glow, (x, y))
 
     # pieces (skip the one currently being dragged; drawn on top separately).
-    # If a premove is queued, render it optimistically: the piece hops to
-    # the premove's target square immediately, chess.com-style, purely for
-    # display -- the real board underneath is untouched. Once the premove
-    # resolves (fires because it turned out legal, so the real board catches
-    # up, or gets silently discarded because it didn't), this same map is
-    # simply rebuilt from the unchanged real board next frame, so an
-    # illegal premove's piece visually snaps back to its original square
-    # on its own.
+    # If premoves are queued, render them optimistically in order: each
+    # piece hops to its premove's target square immediately, chess.com-
+    # style, purely for display -- the real board underneath is untouched.
+    # Once a premove resolves (fires because it turned out legal, so the
+    # real board catches up, or gets silently discarded -- along with the
+    # rest of the queue -- because it didn't), this same map is simply
+    # rebuilt from the unchanged real board next frame, so any premoved
+    # pieces visually snap back to their original squares on their own.
     piece_map = {sq: board.piece_at(sq) for sq in chess.SQUARES if board.piece_at(sq) is not None}
-    if premove is not None:
-        moved_piece = piece_map.pop(premove[0], None)
+    for from_sq, to_sq in premoves:
+        moved_piece = piece_map.pop(from_sq, None)
         if moved_piece is not None:
-            piece_map[premove[1]] = moved_piece
+            piece_map[to_sq] = moved_piece
 
     for square in chess.SQUARES:
         if square == dragging_square:
@@ -445,7 +476,12 @@ def draw_popup(screen, font, big_font, result_text, pgn_copied):
 
     mouse_pos = pygame.mouse.get_pos()
     draw_button(screen, font, COPY_PGN_BTN_RECT, "Copy PGN", COPY_PGN_BTN_RECT.collidepoint(mouse_pos))
-    draw_button(screen, font, REMATCH_BTN_RECT, "Rematch", REMATCH_BTN_RECT.collidepoint(mouse_pos))
+    draw_button(screen, font, POPUP_ANALYSIS_BTN_RECT, "Analysis",
+                POPUP_ANALYSIS_BTN_RECT.collidepoint(mouse_pos))
+    draw_button(screen, font, REMATCH_WHITE_BTN_RECT, "Rematch as White",
+                REMATCH_WHITE_BTN_RECT.collidepoint(mouse_pos))
+    draw_button(screen, font, REMATCH_BLACK_BTN_RECT, "Rematch as Black",
+                REMATCH_BLACK_BTN_RECT.collidepoint(mouse_pos))
 
     if pgn_copied:
         note = font.render("PGN copied to clipboard!", True, (140, 220, 150))
@@ -453,7 +489,7 @@ def draw_popup(screen, font, big_font, result_text, pgn_copied):
 
 
 def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
-                  thinking, san_history, result_text, premove, show_eval_bar,
+                  thinking, san_history, result_text, premoves, show_eval_bar,
                   moves_scroll):
     pygame.draw.rect(screen, SIDEBAR_BG, (SIDEBAR_X, 0, SIDEBAR_W, WINDOW_H))
     pad = 18
@@ -489,11 +525,12 @@ def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
             screen.blit(font.render("Model is thinking...", True, (120, 200, 255)),
                         (SIDEBAR_X + pad, y))
             y += 26
-        if premove is not None:
-            from_sq, to_sq = premove
-            label = f"Premove queued: {chess.square_name(from_sq)}-{chess.square_name(to_sq)}"
-            screen.blit(font.render(label, True, (120, 170, 250)), (SIDEBAR_X + pad, y))
-            y += 26
+        if premoves:
+            chain = " -> ".join(f"{chess.square_name(f)}-{chess.square_name(t)}" for f, t in premoves)
+            for line in wrap_text(f"Premoves queued: {chain}", font, SIDEBAR_W - 2 * pad):
+                screen.blit(font.render(line, True, (120, 170, 250)), (SIDEBAR_X + pad, y))
+                y += 22
+            y += 4
 
     y += 10
     screen.blit(font.render("Moves:", True, SIDEBAR_TEXT), (SIDEBAR_X + pad, y))
@@ -531,11 +568,92 @@ def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
         hint = font.render("v more moves below", True, SIDEBAR_SUBTEXT)
         screen.blit(hint, (SIDEBAR_X + pad, min(y, EVAL_TOGGLE_RECT.top - 22)))
 
+    # Analysis button, pinned near the bottom-left of the right panel.
+    mouse_pos = pygame.mouse.get_pos()
+    draw_button(screen, font, ANALYSIS_BTN_RECT, "Analysis", ANALYSIS_BTN_RECT.collidepoint(mouse_pos))
+
     # Eval sidebar toggle, pinned near the bottom of the right panel.
     eval_label = font.render("Eval Sidebar", True, SIDEBAR_SUBTEXT)
     screen.blit(eval_label, (EVAL_TOGGLE_RECT.left - 10 - eval_label.get_width(),
                               EVAL_TOGGLE_RECT.centery - eval_label.get_height() // 2))
     draw_toggle(screen, EVAL_TOGGLE_RECT, show_eval_bar)
+
+    return max_scroll
+
+
+# ----------------------------------------------------------------------
+# Game analysis overlay -- full-window panel listing, for every move the
+# model has made so far, its search's evaluation of the position it was
+# choosing from and the top candidate moves it considered (by
+# search-visit share), next to the move it actually played.
+# ----------------------------------------------------------------------
+
+ANALYSIS_BG = (15, 16, 20, 235)
+ANALYSIS_ROW_H = 66
+
+
+def draw_analysis(screen, font, big_font, move_analysis, scroll):
+    overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+    overlay.fill(ANALYSIS_BG)
+    screen.blit(overlay, (0, 0))
+
+    title = big_font.render("Game Analysis", True, (245, 245, 245))
+    screen.blit(title, (30, 20))
+
+    mouse_pos = pygame.mouse.get_pos()
+    close_hovered = ANALYSIS_CLOSE_BTN_RECT.collidepoint(mouse_pos)
+    pygame.draw.rect(screen, (90, 95, 105) if close_hovered else (70, 74, 84),
+                      ANALYSIS_CLOSE_BTN_RECT, border_radius=6)
+    x_label = font.render("X", True, (240, 240, 240))
+    screen.blit(x_label, x_label.get_rect(center=ANALYSIS_CLOSE_BTN_RECT.center))
+
+    pad = 30
+    y0 = 72
+
+    if not move_analysis:
+        empty = font.render(
+            "No model moves recorded yet -- they'll appear here as the model plays.",
+            True, (190, 190, 195))
+        screen.blit(empty, (pad, y0))
+        return 0
+
+    subtitle = font.render(
+        "Evaluation is from White's perspective (+ favors White). "
+        "\"Considered\" lists the model's top candidates by share of search visits.",
+        True, SIDEBAR_SUBTEXT)
+    screen.blit(subtitle, (pad, y0))
+    list_top = y0 + 30
+
+    visible_h = WINDOW_H - list_top - 20
+    max_lines = max(1, visible_h // ANALYSIS_ROW_H)
+    total = len(move_analysis)
+    max_scroll = max(0, total - max_lines)
+    scroll = max(0, min(scroll, max_scroll))
+
+    # scroll=0 pins to the latest (most recent) model move, mirroring the
+    # move-list sidebar's scroll convention.
+    start = max(0, total - max_lines - scroll)
+    end = min(total, start + max_lines)
+
+    y = list_top
+    for entry in move_analysis[start:end]:
+        header = (f"{entry['move_number']}. {entry['color']}: {entry['san']}"
+                   f"    eval: {entry['value_white']:+.2f}")
+        screen.blit(font.render(header, True, (235, 235, 235)), (pad, y))
+        y += 24
+        cand_strs = [f"{san} {pct * 100:.0f}% ({cnt})" for san, cnt, pct in entry["candidates"]]
+        cand_line = "Considered: " + ", ".join(cand_strs) if cand_strs else "Considered: (no data)"
+        for line in wrap_text(cand_line, font, WINDOW_W - 2 * pad)[:1]:
+            screen.blit(font.render(line, True, (150, 200, 255)), (pad, y))
+            y += 20
+        y += ANALYSIS_ROW_H - 44
+
+    if start > 0:
+        hint = font.render("^ scroll up for earlier moves", True, (170, 170, 175))
+        screen.blit(hint, (pad, list_top - 22))
+    if end < total:
+        hint = font.render("v scroll down for more moves", True, (170, 170, 175))
+        screen.blit(hint, (pad, WINDOW_H - 22))
 
     return max_scroll
 
@@ -624,11 +742,30 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue):
     (a chess.Board the GUI thread will not mutate again until the move
     lands), so there is no concurrent-write race with the render loop,
     which only reads the *live* board object (a different one) each frame.
+
+    Also hands back the raw search-visit counts and root value alongside
+    the chosen move -- these are exactly what the game-analysis panel
+    needs to show how the model evaluated the position and which
+    candidates its search preferred, and they're already produced by
+    train.search() for free.
+
+    Mate-in-1 safety net: checked before trusting MCTS at all, same as
+    self-play/tournament in train.py. Regardless of what search/value
+    currently believe, if a legal move mates right now, play it --
+    full stop, no dependence on sims/visit convergence. The synthetic
+    visits/value below just make the analysis panel show this clearly
+    (100% on the mating move, value pinned to a win) rather than lying
+    about there having been a real search.
     """
     try:
-        visits, _ = train.search(proc, board_snapshot, sims=sims, threads=threads)
+        mate_move = train.find_immediate_mate(board_snapshot)
+        if mate_move is not None:
+            best_uci = mate_move.uci()
+            result_queue.put(("ok", {"uci": best_uci, "visits": {best_uci: 1}, "value": 1.0}))
+            return
+        visits, value = train.search(proc, board_snapshot, sims=sims, threads=threads)
         best_uci = train.pick_move_from_visits(visits, temperature=0.0)
-        result_queue.put(("ok", best_uci))
+        result_queue.put(("ok", {"uci": best_uci, "visits": visits, "value": value}))
     except Exception as e:  # surface engine crashes to the GUI instead of hanging it
         result_queue.put(("error", str(e)))
 
@@ -653,6 +790,7 @@ class Game:
         self.flipped = not self.human_is_white
         # Whichever color sits at the bottom of the board picks the
         # matching background art (pre-rendered coordinate labels, etc.).
+        self._board_backgrounds = board_backgrounds
         self.board_bg = board_backgrounds["white" if self.human_is_white else "black"]
 
         self.board = None
@@ -665,15 +803,30 @@ class Game:
         self.moves_scroll = 0  # 0 = pinned to the latest move
         self.moves_max_scroll = 0
 
-        # Premove: a queued (from_square, to_square) the human staged while
-        # it wasn't their turn. Executed automatically the instant the
-        # model's move lands, if it's still legal then; otherwise it's
-        # silently discarded, same as chess.com. Deliberately unrestricted
-        # (any square, ignoring normal movement/check rules) while
-        # choosing a destination -- only the final legality check (against
-        # the real position once the model actually moves) matters.
-        self.premove = None
+        # Premoves: an ordered queue of (from_square, to_square) pairs the
+        # human staged while it wasn't their turn. One fires per model
+        # move, in order -- the instant a model move lands, the first
+        # queued premove is tried; if it's still legal it's played
+        # automatically, otherwise it (and the rest of the queue, since
+        # it was planned assuming the discarded one would land first) is
+        # silently dropped, same as chess.com. Deliberately unrestricted
+        # while choosing a destination -- any square, including one
+        # occupied by another of the player's own pieces (e.g. to queue a
+        # recapture before the capture that creates it has even happened),
+        # ignoring normal movement/check rules entirely; only the final
+        # legality check (against the real position once the model
+        # actually moves) matters.
+        self.premoves = []
         self.premove_selected_square = None
+
+        # Game analysis: one entry per model move so far this game,
+        # recording the search's root evaluation and its top candidate
+        # moves by visit share, captured the instant each model move is
+        # decided (see record_model_analysis / poll_model_move).
+        self.move_analysis = []
+        self.show_analysis = False
+        self.analysis_scroll = 0
+        self.analysis_max_scroll = 0
 
         # Eval bar: a static model value-head estimate for the current
         # position, from White's perspective, in [-1, 1]. Toggleable via
@@ -689,7 +842,16 @@ class Game:
 
         self.reset_game()
 
-    def reset_game(self):
+    def reset_game(self, human_is_white=None):
+        """Starts a fresh game. `human_is_white`, if given, switches which
+        color the human plays (used by the "Rematch as White/Black"
+        popup buttons); omitted (e.g. pressing 'r'), it keeps whatever
+        color was just being played."""
+        if human_is_white is not None and human_is_white != self.human_is_white:
+            self.human_is_white = human_is_white
+            self.flipped = not self.human_is_white
+            self.board_bg = self._board_backgrounds["white" if self.human_is_white else "black"]
+
         self.board = chess.Board()
         self.selected_square = None
         self.legal_targets = []
@@ -698,11 +860,15 @@ class Game:
         self.san_history = []
         self.result_text = None
         self.moves_scroll = 0
-        self.premove = None
+        self.premoves = []
         self.premove_selected_square = None
         self.pgn_copied_at = None
         self.thinking = False
         self.worker_thread = None
+        self.move_analysis = []
+        self.show_analysis = False
+        self.analysis_scroll = 0
+        self.analysis_max_scroll = 0
         while not self.result_queue.empty():
             self.result_queue.get_nowait()
         self.compute_eval()
@@ -804,10 +970,10 @@ class Game:
         else:
             # The model just moved -- it's now genuinely the human's turn,
             # so any in-progress (not-yet-finalized) premove selection is
-            # stale and shouldn't keep showing. If a full premove was
-            # queued, try to fire it now.
+            # stale and shouldn't keep showing. If a premove is queued,
+            # try to fire the next one now.
             self.premove_selected_square = None
-            if not self.result_text and self.premove is not None:
+            if not self.result_text and self.premoves:
                 self.try_execute_premove()
 
     def scroll_moves(self, direction):
@@ -834,8 +1000,38 @@ class Game:
         if status == "error":
             self.result_text = f"Engine error: {payload}"
             return
-        move = chess.Move.from_uci(payload)
+        move = chess.Move.from_uci(payload["uci"])
+        # Must run before push_move: it needs self.board (and self.board.san)
+        # in the pre-move position to label the chosen move and its
+        # candidates, and push_move mutates self.board in place.
+        self.record_model_analysis(move, payload["visits"], payload["value"])
         self.push_move(move, mover_is_human=False)
+
+    def record_model_analysis(self, move, visits, value):
+        """Captures how the model's search evaluated the position it just
+        moved from: the root value estimate (converted to White's
+        perspective, matching the eval bar) and its top few candidate
+        moves by share of search visits. Called right before the move is
+        applied, so `self.board` is still the position being analyzed."""
+        mover_is_white = self.board.turn == chess.WHITE
+        total_visits = sum(visits.values()) or 1
+        top_candidates = sorted(visits.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        candidates = []
+        for uci, count in top_candidates:
+            try:
+                san = self.board.san(chess.Move.from_uci(uci))
+            except Exception:
+                san = uci
+            candidates.append((san, count, count / total_visits))
+
+        self.move_analysis.append({
+            "move_number": len(self.san_history) // 2 + 1,
+            "color": "White" if mover_is_white else "Black",
+            "san": self.board.san(move),
+            "value_white": value if mover_is_white else -value,
+            "candidates": candidates,
+        })
+        self.analysis_scroll = 0  # auto-follow the latest analyzed move
 
     def check_game_over(self):
         if self.board.is_game_over(claim_draw=True):
@@ -849,26 +1045,38 @@ class Game:
     # ---------------- premove ----------------
 
     def handle_premove_mousedown(self, sq):
-        # Clicking the start square of an already-queued premove cancels it.
-        if self.premove is not None and sq == self.premove[0]:
-            self.premove = None
-            return
-
         piece_at_sq = self.board.piece_at(sq)
         is_own_piece = piece_at_sq is not None and \
             (piece_at_sq.color == chess.WHITE) == self.human_is_white
 
-        if self.premove_selected_square is not None and sq == self.premove_selected_square:
-            # re-clicking the already-chosen piece cancels the selection
-            self.premove_selected_square = None
-            self.dragging_square = None
-            return
-
-        if self.premove_selected_square is not None and not is_own_piece:
-            # click-click finalize (mirrors the human-turn move flow below)
+        if self.premove_selected_square is not None:
+            if sq == self.premove_selected_square:
+                # re-clicking the already-chosen piece cancels the selection
+                self.premove_selected_square = None
+                self.dragging_square = None
+                return
+            # click-click finalize (mirrors the human-turn move flow below).
+            # Deliberately allowed to target ANY square -- including one
+            # with one of the player's own pieces (e.g. queuing a
+            # recapture) or the start square of another already-queued
+            # premove -- only the real legality check once it's about to
+            # fire (see try_execute_premove) decides whether it plays.
+            # This check MUST come before the "cancel a queued premove"
+            # check below: otherwise finalizing a second/third premove
+            # whose destination happens to land on an earlier queued
+            # premove's start square would silently cancel that one
+            # instead of queuing the new one.
             self.finalize_premove(self.premove_selected_square, sq)
             self.dragging_square = None
             return
+
+        # No selection in progress -- clicking the start square of an
+        # already-queued premove cancels just that one (leaving the rest
+        # of the queue intact).
+        for i, (from_sq, _) in enumerate(self.premoves):
+            if sq == from_sq:
+                del self.premoves[i]
+                return
 
         if is_own_piece:
             # start a new selection, and also arm dragging so the piece can
@@ -880,22 +1088,27 @@ class Game:
             self.dragging_square = None
 
     def finalize_premove(self, from_sq, to_sq):
-        """Queues (from_sq, to_sq) as the premove. Deliberately unrestricted
-        -- any square, ignoring normal movement/check rules entirely -- only
-        the real legality check once the model's move actually lands (see
-        try_execute_premove) decides whether it fires."""
-        self.premove = (from_sq, to_sq)
+        """Appends (from_sq, to_sq) to the premove queue. Deliberately
+        unrestricted -- any square, including one occupied by another of
+        the player's own pieces, ignoring normal movement/check rules
+        entirely -- only the real legality check once it's next in line to
+        fire (see try_execute_premove) decides whether it actually plays."""
+        self.premoves.append((from_sq, to_sq))
         self.premove_selected_square = None
         self.play_sound("premove")
 
     def try_execute_premove(self):
-        if self.premove is None:
+        if not self.premoves:
             return
-        from_sq, to_sq = self.premove
-        self.premove = None
+        from_sq, to_sq = self.premoves.pop(0)
         candidates = [m for m in self.legal_moves_from(from_sq) if m.to_square == to_sq]
         if not candidates:
-            return  # no longer legal -- silently discarded, like chess.com
+            # No longer legal -- silently discarded, like chess.com. The
+            # rest of the queue was planned assuming this move would land
+            # first, so it's stale too; drop it rather than firing moves
+            # in an order/position the player never actually queued for.
+            self.premoves = []
+            return
         if len(candidates) == 1:
             move = candidates[0]
         else:
@@ -910,12 +1123,33 @@ class Game:
             pgn = build_pgn(self.board, self.human_is_white, self.args.model)
             copy_to_clipboard(pgn)
             self.pgn_copied_at = pygame.time.get_ticks()
-        elif REMATCH_BTN_RECT.collidepoint(pos):
-            self.reset_game()
+        elif POPUP_ANALYSIS_BTN_RECT.collidepoint(pos):
+            self.show_analysis = True
+        elif REMATCH_WHITE_BTN_RECT.collidepoint(pos):
+            self.reset_game(human_is_white=True)
+        elif REMATCH_BLACK_BTN_RECT.collidepoint(pos):
+            self.reset_game(human_is_white=False)
+
+    # ---------------- game analysis overlay ----------------
+
+    def handle_analysis_click(self, pos):
+        if ANALYSIS_CLOSE_BTN_RECT.collidepoint(pos):
+            self.show_analysis = False
+
+    def scroll_analysis(self, direction):
+        self.analysis_scroll = max(0, min(self.analysis_scroll + direction, self.analysis_max_scroll))
 
     # ---------------- events ----------------
 
     def handle_mousedown(self, pos):
+        if self.show_analysis:
+            self.handle_analysis_click(pos)
+            return
+
+        if ANALYSIS_BTN_RECT.collidepoint(pos):
+            self.show_analysis = True
+            return
+
         if self.result_text is not None:
             self.handle_popup_click(pos)
             return
@@ -972,18 +1206,15 @@ class Game:
         sq = pixel_to_square(pos, self.flipped)
 
         if not self.human_turn():
-            # Premove drag-and-drop.
+            # Premove drag-and-drop. Dropping on a square occupied by
+            # another of the player's own pieces is allowed too -- it
+            # queues a premove there anyway (e.g. a recapture queued
+            # before the opponent's capture that creates it has landed);
+            # only the real legality check when it's about to fire (see
+            # try_execute_premove) decides whether it actually plays.
             if sq is None or sq == drag_square:
                 # released back where it was picked up -- plain click,
                 # selection already set by handle_premove_mousedown
-                return
-            piece_at_sq = self.board.piece_at(sq)
-            is_own_piece = piece_at_sq is not None and \
-                (piece_at_sq.color == chess.WHITE) == self.human_is_white
-            if is_own_piece:
-                # dropped on another of the player's own pieces -> switch
-                # the premove selection to it instead of finalizing
-                self.premove_selected_square = sq
                 return
             self.finalize_premove(drag_square, sq)
             return
@@ -1008,18 +1239,22 @@ class Game:
                       self.human_is_white)
         draw_board(self.screen, self.board_bg, self.board, self.images, self.flipped,
                    self.selected_square, self.legal_targets, self.last_move,
-                   self.dragging_square, self.premove, self.premove_selected_square)
+                   self.dragging_square, self.premoves, self.premove_selected_square)
         draw_dragging_piece(self.screen, self.images, self.board, self.dragging_square,
                              pygame.mouse.get_pos())
         self.moves_max_scroll = draw_sidebar(
             self.screen, self.font, self.big_font, self.board, self.human_is_white,
             self.args.model, self.thinking, self.san_history, self.result_text,
-            self.premove, self.show_eval_bar, self.moves_scroll)
+            self.premoves, self.show_eval_bar, self.moves_scroll)
 
         if self.result_text is not None:
             pgn_copied = self.pgn_copied_at is not None and \
                 pygame.time.get_ticks() - self.pgn_copied_at < 2000
             draw_popup(self.screen, self.font, self.big_font, self.result_text, pgn_copied)
+
+        if self.show_analysis:
+            self.analysis_max_scroll = draw_analysis(
+                self.screen, self.font, self.big_font, self.move_analysis, self.analysis_scroll)
 
 
 def main():
@@ -1064,7 +1299,14 @@ def main():
     pygame.init()
     pygame.mixer.init()
     pygame.display.set_caption("Chess vs Model")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    # RESIZABLE lets the user drag the window to any size; SCALED keeps
+    # all of the drawing code above working at its fixed logical
+    # resolution (WINDOW_W x WINDOW_H) while pygame automatically scales
+    # that to whatever the actual window/display size is -- including
+    # fullscreen (toggled below with F11) -- and automatically translates
+    # mouse event coordinates back into logical space, so none of the
+    # click hit-testing elsewhere needs to change.
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE | pygame.SCALED)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("arial", 18)
     big_font = pygame.font.SysFont("arial", 26, bold=True)
@@ -1087,13 +1329,21 @@ def main():
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     game.handle_mouseup(event.pos)
                 elif event.type == pygame.MOUSEWHEEL:
-                    if pygame.mouse.get_pos()[0] >= SIDEBAR_X:
+                    if game.show_analysis:
+                        game.scroll_analysis(event.y)
+                    elif pygame.mouse.get_pos()[0] >= SIDEBAR_X:
                         game.scroll_moves(event.y)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_q:
                         running = False
                     elif event.key == pygame.K_r and game.result_text is not None:
                         game.reset_game()
+                    elif event.key == pygame.K_F11:
+                        pygame.display.toggle_fullscreen()
+                    elif event.key == pygame.K_a:
+                        game.show_analysis = not game.show_analysis
+                    elif event.key == pygame.K_ESCAPE and game.show_analysis:
+                        game.show_analysis = False
 
             game.poll_model_move()
             game.draw_frame()
