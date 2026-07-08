@@ -343,6 +343,74 @@ def pixel_to_square(pos, flipped: bool):
     return chess.square(file, rank)
 
 
+def compute_premove_piece_map(board, premoves):
+    """The board's piece placement after optimistically applying every
+    queued premove in order, purely for display/selection purposes -- the
+    real board itself is untouched. Used both to render premoved pieces on
+    their (not-yet-real) destination squares, and to let the player pick
+    up such a piece again to queue the *next* link of a premove chain
+    (e.g. premove a pawn e2-e4, then, without waiting for it to land,
+    premove the same pawn onward from e4-e5)."""
+    piece_map = {sq: board.piece_at(sq) for sq in chess.SQUARES if board.piece_at(sq) is not None}
+    for from_sq, to_sq in premoves:
+        moved_piece = piece_map.pop(from_sq, None)
+        if moved_piece is not None:
+            piece_map[to_sq] = moved_piece
+    return piece_map
+
+
+def premove_shape_ok(board, premoves, from_sq, to_sq):
+    """Loose legality filter applied when queuing a premove: restricts the
+    destination to a square that's at least geometrically reachable for
+    the piece being (optimistically) moved -- i.e. the correct movement
+    pattern for its type (pawn forward/diagonal, knight L-shape, bishop
+    diagonal, rook straight, queen either, king one square or a castling
+    slide). It deliberately ignores board occupancy, check, and whose
+    turn it actually is otherwise -- a premove is still allowed to target
+    a currently-occupied-by-own-piece square, or a square that's only
+    reachable because of how prior queued premoves will have moved
+    things -- exactly mirroring chess.com's own input restriction on
+    premoves. The real legality check happens later, once the premove is
+    next in line to fire (see try_execute_premove)."""
+    if from_sq == to_sq:
+        return False
+    piece = compute_premove_piece_map(board, premoves).get(from_sq)
+    if piece is None:
+        return False
+
+    ff, fr = chess.square_file(from_sq), chess.square_rank(from_sq)
+    tf, tr = chess.square_file(to_sq), chess.square_rank(to_sq)
+    df, dr = tf - ff, tr - fr
+    adf, adr = abs(df), abs(dr)
+
+    pt = piece.piece_type
+    if pt == chess.KNIGHT:
+        return (adf, adr) in ((1, 2), (2, 1))
+    if pt == chess.BISHOP:
+        return adf == adr and adf != 0
+    if pt == chess.ROOK:
+        return (df == 0) != (dr == 0)
+    if pt == chess.QUEEN:
+        return (adf == adr and adf != 0) or ((df == 0) != (dr == 0))
+    if pt == chess.KING:
+        if max(adf, adr) == 1:
+            return True
+        # castling: king slides two squares along its own home rank
+        home_rank = 0 if piece.color == chess.WHITE else 7
+        return dr == 0 and fr == home_rank and adf == 2
+    if pt == chess.PAWN:
+        forward = 1 if piece.color == chess.WHITE else -1
+        start_rank = 1 if piece.color == chess.WHITE else 6
+        if df == 0 and dr == forward:
+            return True
+        if df == 0 and dr == 2 * forward and fr == start_rank:
+            return True
+        if adf == 1 and dr == forward:
+            return True
+        return False
+    return False
+
+
 # ----------------------------------------------------------------------
 # Rendering
 # ----------------------------------------------------------------------
@@ -391,11 +459,7 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
     # rest of the queue -- because it didn't), this same map is simply
     # rebuilt from the unchanged real board next frame, so any premoved
     # pieces visually snap back to their original squares on their own.
-    piece_map = {sq: board.piece_at(sq) for sq in chess.SQUARES if board.piece_at(sq) is not None}
-    for from_sq, to_sq in premoves:
-        moved_piece = piece_map.pop(from_sq, None)
-        if moved_piece is not None:
-            piece_map[to_sq] = moved_piece
+    piece_map = compute_premove_piece_map(board, premoves)
 
     for square in chess.SQUARES:
         if square == dragging_square:
@@ -418,10 +482,10 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
         screen.blit(overlay, (x, y))
 
 
-def draw_dragging_piece(screen, images, board, dragging_square, mouse_pos):
+def draw_dragging_piece(screen, images, board, premoves, dragging_square, mouse_pos):
     if dragging_square is None:
         return
-    piece = board.piece_at(dragging_square)
+    piece = compute_premove_piece_map(board, premoves).get(dragging_square)
     if piece is None:
         return
     img = images[(piece.color, piece.piece_type)]
@@ -1045,7 +1109,13 @@ class Game:
     # ---------------- premove ----------------
 
     def handle_premove_mousedown(self, sq):
-        piece_at_sq = self.board.piece_at(sq)
+        # Use the optimistic (post-premove-chain) piece placement, not the
+        # real board, so a piece that's already been virtually moved by an
+        # earlier queued premove -- and so only "lives" on its destination
+        # square in the optimistic view -- can still be picked up here to
+        # queue the next link of the chain (e.g. premove e2-e4, then,
+        # without waiting for it to land, premove that same pawn e4-e5).
+        piece_at_sq = compute_premove_piece_map(self.board, self.premoves).get(sq)
         is_own_piece = piece_at_sq is not None and \
             (piece_at_sq.color == chess.WHITE) == self.human_is_white
 
@@ -1088,11 +1158,19 @@ class Game:
             self.dragging_square = None
 
     def finalize_premove(self, from_sq, to_sq):
-        """Appends (from_sq, to_sq) to the premove queue. Deliberately
-        unrestricted -- any square, including one occupied by another of
-        the player's own pieces, ignoring normal movement/check rules
-        entirely -- only the real legality check once it's next in line to
-        fire (see try_execute_premove) decides whether it actually plays."""
+        """Appends (from_sq, to_sq) to the premove queue, provided the
+        destination at least matches the piece's own movement pattern
+        (see premove_shape_ok) -- so a pawn still can't be premoved three
+        squares, or a knight moved diagonally like a bishop, etc. Beyond
+        that it's deliberately unrestricted: any square, including one
+        occupied by another of the player's own pieces, ignoring
+        occupancy/check/whose-turn-it-is otherwise -- only the real
+        legality check once it's next in line to fire (see
+        try_execute_premove) decides whether it actually plays."""
+        if not premove_shape_ok(self.board, self.premoves, from_sq, to_sq):
+            self.play_sound("illegal")
+            self.premove_selected_square = None
+            return
         self.premoves.append((from_sq, to_sq))
         self.premove_selected_square = None
         self.play_sound("premove")
@@ -1205,31 +1283,52 @@ class Game:
 
         sq = pixel_to_square(pos, self.flipped)
 
-        if not self.human_turn():
-            # Premove drag-and-drop. Dropping on a square occupied by
-            # another of the player's own pieces is allowed too -- it
-            # queues a premove there anyway (e.g. a recapture queued
-            # before the opponent's capture that creates it has landed);
-            # only the real legality check when it's about to fire (see
-            # try_execute_premove) decides whether it actually plays.
-            if sq is None or sq == drag_square:
-                # released back where it was picked up -- plain click,
-                # selection already set by handle_premove_mousedown
+        if self.human_turn():
+            # It's genuinely the human's turn right now -- true even if it
+            # WASN'T when this drag started (the model's move can land,
+            # and any queued premove auto-fire with it, while a premove
+            # drag is still in progress). Recompute everything fresh
+            # against the live board rather than trusting self.legal_targets,
+            # which premove-mode mousedown never populates (it would
+            # incorrectly look empty) and which could otherwise be stale.
+            piece = self.board.piece_at(drag_square)
+            is_own_piece = piece is not None and (piece.color == chess.WHITE) == self.human_is_white
+            if not is_own_piece:
+                # The piece we picked up is no longer ours to move from
+                # here -- e.g. the model's move captured it mid-drag.
+                # Nothing sane to do but drop the attempt quietly.
+                self.selected_square = None
+                self.legal_targets = []
+                self.premove_selected_square = None
                 return
-            self.finalize_premove(drag_square, sq)
-            return
 
-        if sq == drag_square:
-            # released right back where it was picked up -- treat as a
-            # plain click, keep the selection so the next click can move it
-            return
-        if sq is not None and sq in self.legal_targets:
-            self.try_move(drag_square, sq)
+            legal_targets = [m.to_square for m in self.legal_moves_from(drag_square)]
+            if sq == drag_square:
+                # released right back where it was picked up -- treat as
+                # a plain click, keep it selected so the next click can move it
+                self.selected_square = drag_square
+                self.legal_targets = legal_targets
+                return
+            if sq is not None and sq in legal_targets:
+                self.try_move(drag_square, sq)
+            else:
+                # dropped on a square that isn't a legal destination
+                self.play_sound("illegal")
             self.selected_square = None
             self.legal_targets = []
-        else:
-            # dropped on a square that isn't a legal destination
-            self.play_sound("illegal")
+            return
+
+        # Premove drag-and-drop: still genuinely not the human's turn.
+        # Dropping on a square occupied by another of the player's own
+        # pieces is allowed too -- it queues a premove there anyway (e.g.
+        # a recapture queued before the opponent's capture that creates
+        # it has landed); only the real legality check when it's about to
+        # fire (see try_execute_premove) decides whether it actually plays.
+        if sq is None or sq == drag_square:
+            # released back where it was picked up -- plain click,
+            # selection already set by handle_premove_mousedown
+            return
+        self.finalize_premove(drag_square, sq)
 
     # ---------------- drawing ----------------
 
@@ -1240,8 +1339,8 @@ class Game:
         draw_board(self.screen, self.board_bg, self.board, self.images, self.flipped,
                    self.selected_square, self.legal_targets, self.last_move,
                    self.dragging_square, self.premoves, self.premove_selected_square)
-        draw_dragging_piece(self.screen, self.images, self.board, self.dragging_square,
-                             pygame.mouse.get_pos())
+        draw_dragging_piece(self.screen, self.images, self.board, self.premoves,
+                             self.dragging_square, pygame.mouse.get_pos())
         self.moves_max_scroll = draw_sidebar(
             self.screen, self.font, self.big_font, self.board, self.human_is_white,
             self.args.model, self.thinking, self.san_history, self.result_text,
