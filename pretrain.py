@@ -127,6 +127,50 @@ def parse_eval_to_z(comment: str, eval_scale: float) -> float | None:
     return float(np.tanh(pawns / eval_scale))
 
 
+# NAG (Numeric Annotation Glyph) codes for move-quality suffixes, per the
+# PGN standard: $1 "!" good, $2 "?" mistake, $3 "!!" brilliant,
+# $4 "??" blunder, $5 "!?" speculative, $6 "?!" dubious/inaccuracy.
+# python-chess parses suffixes like "h6??" straight from SAN into
+# node.nags, independent of language/broadcast, so this is the primary,
+# more robust signal.
+NAG_SEVERITY = {4: 1.0, 2: 0.5, 6: 0.25}
+
+# Fallback: Lichess-style analysis comments spell it out in English
+# regardless of the broadcast's own language (see the Chinese-titled
+# broadcast in this project's sample PGN, which still says "Blunder."/
+# "Mistake."/"Inaccuracy." in the comment text). Used when a source
+# doesn't carry NAGs but does carry this commentary.
+BLUNDER_TEXT_RE = re.compile(r"\b(Blunder|Mistake|Inaccuracy)\b")
+TEXT_SEVERITY = {"Blunder": 1.0, "Mistake": 0.5, "Inaccuracy": 0.25}
+
+
+def move_quality_penalty(node) -> float:
+    """Returns a severity in [0, 1] if `node` -- the PGN node for the move
+    that was just played -- was itself flagged as an inaccuracy/mistake/
+    blunder by the annotator, else 0.0.
+
+    0.0 means "ordinary example, imitate normally." A value > 0.0 means
+    the annotator judged this exact move (not the resulting position) to
+    be bad; the caller uses this to train the policy head away from that
+    move instead of imitating it, scaled by severity. This deliberately
+    doesn't drop the example -- the position and its value target are
+    still useful training signal (see --value-target eval/blend for how
+    the value head learns from it) -- it only changes how the *policy*
+    head treats the move that was played there.
+    """
+    if node is None:
+        return 0.0
+    severity = 0.0
+    for nag in node.nags:
+        if nag in NAG_SEVERITY:
+            severity = max(severity, NAG_SEVERITY[nag])
+    if node.comment:
+        m = BLUNDER_TEXT_RE.search(node.comment)
+        if m:
+            severity = max(severity, TEXT_SEVERITY[m.group(1)])
+    return severity
+
+
 # ----------------------------------------------------------------------
 # Streaming example generator
 # ----------------------------------------------------------------------
@@ -158,14 +202,18 @@ def resolve_pgn_paths(pgn_arg: list[str]) -> list[str]:
 def iter_examples(pgn_paths: list[str], skip_bots: bool, min_elo: int | None,
                    value_target: str = "outcome", eval_weight: float = 0.5,
                    eval_scale: float = 400.0):
-    """Yields (state, policy_idx, z) for every position in every game
-    across every file in pgn_paths, streaming game-by-game (and file-by-
-    file) so nothing ever has to sit fully in memory. `state` is a
+    """Yields (state, policy_idx, z, quality_penalty) for every position in
+    every game across every file in pgn_paths, streaming game-by-game (and
+    file-by-file) so nothing ever has to sit fully in memory. `state` is a
     (13, 8, 8) float32 array from train.board_to_tensor; `policy_idx` is
     an int in [0, ACTION_SIZE); `z` is a float in {+1, -1, 0} (or, in
     "eval"/"blend" mode, a continuous value in [-1, 1]) from the mover's
     own perspective at that position, matching train.py's self-play
-    buffer convention.
+    buffer convention. `quality_penalty` is 0.0 for an ordinary move, or
+    in (0, 1] if the move actually played was itself flagged as an
+    inaccuracy/mistake/blunder by the PGN annotator -- see
+    move_quality_penalty() for how the caller should use this (train the
+    policy head away from that move rather than imitating it).
 
     value_target controls where z comes from:
       - "outcome": always the game's final result (original behavior).
@@ -235,10 +283,17 @@ def iter_examples(pgn_paths: list[str], skip_bots: bool, min_elo: int | None,
                     else:
                         z = outcome_z
 
-                    yield state, policy_idx, z
                     board.push(move)
                     node = node.next()
+                    # `node` now IS the node for the move we just played --
+                    # its own nags/comment (e.g. "??" / "Blunder. Nxd3 was
+                    # best.") annotate the quality of THIS move, unlike
+                    # pending_comment above which describes the *resulting*
+                    # position and is used one ply later for eval.
+                    quality_penalty = move_quality_penalty(node)
                     pending_comment = node.comment if node is not None else ""
+
+                    yield state, policy_idx, z, quality_penalty
 
 
 # ----------------------------------------------------------------------
@@ -266,9 +321,11 @@ class Reservoir:
         states = np.stack([self.buf[i][0] for i in idxs])
         policy_idx = np.array([self.buf[i][1] for i in idxs], dtype=np.int64)
         z = np.array([self.buf[i][2] for i in idxs], dtype=np.float32)
+        quality_penalty = np.array([self.buf[i][3] for i in idxs], dtype=np.float32)
         return (torch.from_numpy(states),
                 torch.from_numpy(policy_idx),
-                torch.from_numpy(z).unsqueeze(1))
+                torch.from_numpy(z).unsqueeze(1),
+                torch.from_numpy(quality_penalty))
 
     def __len__(self):
         return len(self.buf)
@@ -279,16 +336,54 @@ class Reservoir:
 # ----------------------------------------------------------------------
 
 def train_chunk(model, optimizer, reservoir, steps, batch_size, device,
-                 value_loss_weight, label_smoothing):
+                 value_loss_weight, label_smoothing, blunder_penalty_weight):
+    """Ordinary examples (quality_penalty == 0) train the policy head as
+    before: label-smoothed cross-entropy imitating the move played.
+
+    Examples flagged by the PGN annotator as an inaccuracy/mistake/blunder
+    (quality_penalty > 0, from move_quality_penalty()) are NOT imitated.
+    Instead they go through an unlikelihood loss that pushes probability
+    mass on that specific move DOWN, scaled by severity and
+    blunder_penalty_weight:
+
+        -log(1 - p_flagged_move)
+
+    This is bounded and well-behaved (unlike naively negating the usual
+    cross-entropy, -log(p), which blows up toward -inf as p->0 and can
+    destabilize training) -- it's the standard "unlikelihood training"
+    trick for teaching a model to avoid a specific output without
+    removing the example (the position/state is still useful training
+    data, e.g. for the value head via --value-target eval/blend).
+    """
     model.train()
-    total_p, total_v = 0.0, 0.0
+    total_p, total_v, total_b, bad_seen = 0.0, 0.0, 0.0, 0
     for _ in range(steps):
-        states, policy_idx, z = reservoir.sample_batch(batch_size)
-        states, policy_idx, z = states.to(device), policy_idx.to(device), z.to(device)
+        states, policy_idx, z, quality_penalty = reservoir.sample_batch(batch_size)
+        states = states.to(device)
+        policy_idx = policy_idx.to(device)
+        z = z.to(device)
+        quality_penalty = quality_penalty.to(device)
 
         logits, pred_value = model(states)
-        policy_loss = F.cross_entropy(logits, policy_idx, label_smoothing=label_smoothing)
         value_loss = F.mse_loss(pred_value, z)
+
+        is_bad = quality_penalty > 0
+        is_good = ~is_bad
+
+        policy_loss = torch.zeros((), device=device)
+        if is_good.any():
+            policy_loss = policy_loss + F.cross_entropy(
+                logits[is_good], policy_idx[is_good], label_smoothing=label_smoothing)
+
+        blunder_loss = torch.zeros((), device=device)
+        if is_bad.any():
+            probs = F.softmax(logits[is_bad], dim=1)
+            p_flagged = probs.gather(1, policy_idx[is_bad].unsqueeze(1)).squeeze(1)
+            severity = quality_penalty[is_bad]
+            blunder_loss = (-torch.log(1.0 - p_flagged + 1e-6) * severity).mean()
+            policy_loss = policy_loss + blunder_penalty_weight * blunder_loss
+            bad_seen += 1
+
         loss = policy_loss + value_loss_weight * value_loss
 
         optimizer.zero_grad()
@@ -297,7 +392,9 @@ def train_chunk(model, optimizer, reservoir, steps, batch_size, device,
 
         total_p += policy_loss.item()
         total_v += value_loss.item()
-    return total_p / steps, total_v / steps
+        total_b += blunder_loss.item()
+    avg_b = total_b / bad_seen if bad_seen else 0.0
+    return total_p / steps, total_v / steps, avg_b
 
 
 def main():
@@ -329,6 +426,17 @@ def main():
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                          help="Softens the one-hot policy target (0.0-0.2 typical). "
                               "Use if post-pretrain policy looks overconfident.")
+    parser.add_argument("--blunder-penalty-weight", type=float, default=1.0,
+                         help="Weight on the unlikelihood loss applied to moves the "
+                              "PGN annotator flagged as an inaccuracy/mistake/blunder "
+                              "(see move_quality_penalty()). These moves are never "
+                              "imitated by the policy head regardless of this value; "
+                              "raising it pushes probability on them down harder. "
+                              "Set to 0.0 to disable (flagged moves are then simply "
+                              "excluded from the policy loss, still contribute to the "
+                              "value loss). Only affects sources with NAGs ('??'/'?'/"
+                              "'?!') or Lichess-style 'Blunder.'/'Mistake.'/"
+                              "'Inaccuracy.' comments -- no effect on PGNs without them.")
     parser.add_argument("--min-elo", type=int, default=None,
                          help="Skip games where either player's Elo is below this "
                               "(default: no filter -- use the full strength spread).")
@@ -393,14 +501,18 @@ def main():
     chunk_count = 0
     since_last_chunk = 0
 
+    flagged_seen = 0
     pbar = tqdm(desc="Streaming positions", unit="pos")
-    for state, policy_idx, z in iter_examples(pgn_paths, skip_bots=not args.include_bots,
-                                               min_elo=args.min_elo,
-                                               value_target=args.value_target,
-                                               eval_weight=args.eval_weight,
-                                               eval_scale=args.eval_scale):
-        reservoir.add((state, policy_idx, z))
+    for state, policy_idx, z, quality_penalty in iter_examples(
+            pgn_paths, skip_bots=not args.include_bots,
+            min_elo=args.min_elo,
+            value_target=args.value_target,
+            eval_weight=args.eval_weight,
+            eval_scale=args.eval_scale):
+        reservoir.add((state, policy_idx, z, quality_penalty))
         since_last_chunk += 1
+        if quality_penalty > 0:
+            flagged_seen += 1
         pbar.update(1)
 
         if args.max_examples and reservoir.total_seen >= args.max_examples:
@@ -409,12 +521,13 @@ def main():
         if since_last_chunk >= args.examples_per_chunk and len(reservoir) >= args.batch_size:
             since_last_chunk = 0
             chunk_count += 1
-            p_loss, v_loss = train_chunk(model, optimizer, reservoir, args.steps_per_chunk,
-                                          args.batch_size, device, args.value_loss_weight,
-                                          args.label_smoothing)
+            p_loss, v_loss, b_loss = train_chunk(model, optimizer, reservoir, args.steps_per_chunk,
+                                                  args.batch_size, device, args.value_loss_weight,
+                                                  args.label_smoothing, args.blunder_penalty_weight)
             logger.info(f"Chunk {chunk_count}: seen={reservoir.total_seen} "
-                        f"buffer={len(reservoir)} avg policy_loss={p_loss:.4f} "
-                        f"avg value_loss={v_loss:.4f}")
+                        f"buffer={len(reservoir)} flagged={flagged_seen} "
+                        f"avg policy_loss={p_loss:.4f} avg value_loss={v_loss:.4f} "
+                        f"avg blunder_loss={b_loss:.4f}")
             if chunk_count % args.save_every_chunks == 0:
                 torch.save(model.state_dict(), args.output)
                 logger.info(f"Saved checkpoint to {args.output}.")
@@ -422,13 +535,16 @@ def main():
 
     # Final polish pass + guaranteed save, even if the stream ended mid-chunk.
     if len(reservoir) >= args.batch_size:
-        p_loss, v_loss = train_chunk(model, optimizer, reservoir, args.steps_per_chunk,
-                                      args.batch_size, device, args.value_loss_weight,
-                                      args.label_smoothing)
-        logger.info(f"Final chunk: avg policy_loss={p_loss:.4f} avg value_loss={v_loss:.4f}")
+        p_loss, v_loss, b_loss = train_chunk(model, optimizer, reservoir, args.steps_per_chunk,
+                                              args.batch_size, device, args.value_loss_weight,
+                                              args.label_smoothing, args.blunder_penalty_weight)
+        logger.info(f"Final chunk: avg policy_loss={p_loss:.4f} avg value_loss={v_loss:.4f} "
+                    f"avg blunder_loss={b_loss:.4f}")
 
     torch.save(model.state_dict(), args.output)
-    logger.info(f"Done. Streamed {reservoir.total_seen} positions across {chunk_count} chunks. "
+    logger.info(f"Done. Streamed {reservoir.total_seen} positions "
+                f"({flagged_seen} flagged as inaccuracy/mistake/blunder, "
+                f"policy-penalized rather than imitated) across {chunk_count} chunks. "
                 f"Saved final checkpoint to {args.output}.")
 
 
