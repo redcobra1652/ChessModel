@@ -18,17 +18,30 @@ venv/
 env/
 ENV/
 
+# ── Stockfish binary ───────────────────────────────────────────────────────────
+# The entire stockfish/ directory (pre-built binaries, source tree, large assets)
+stockfish/
+
+# ── Files over 50 MB (common large artefacts) ─────────────────────────────────
+# replay buffer
+replay_buffer.pkl
+# warm-train PGN datasets
+warm_train/*.pgn
+
 # ── PyTorch model checkpoints ──────────────────────────────────────────────────
-# Uncomment these if you want to ignore model weights (they can be very large).
-# *.pt
-# *.pth
-# *.ckpt
+# Ignore all .pt / .pth / .ckpt checkpoint files by default …
+*.pt
+*.pth
+*.ckpt
+# … EXCEPT the two canonical best-model files that are worth tracking.
+!best_model.pt
+!best_model_stockfish_train.pt
 
 # ── Compiled C++ engine binary ─────────────────────────────────────────────────
 mcts_engine
 
-# ── Training data (large PGN files) ───────────────────────────────────────────
-warm_train/*.pgn
+# ── Training logs ─────────────────────────────────────────────────────────────
+stockfish_curriculum_log.jsonl
 
 # ── macOS system files ─────────────────────────────────────────────────────────
 .DS_Store

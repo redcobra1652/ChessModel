@@ -484,6 +484,82 @@ def pick_move_from_visits(visits: dict, temperature: float) -> str:
     return np.random.choice(moves, p=probs)
 
 
+def find_safe_moves(board: chess.Board):
+    """Returns the subset of board.legal_moves that do NOT hand the
+    opponent an immediate mate-in-1 reply.
+
+    This is the defensive mirror of find_immediate_mate(), which only
+    ever checks whether the side to move CAN mate right now -- it never
+    checks whether a candidate move lets the opponent mate back next
+    move. That gap is real: with a shallow search (few sims) or a value
+    head that hasn't fully learned to weight a one-ply mate threat, MCTS
+    can end up preferring a move that walks straight into a mate the
+    opponent already had lined up, while some other, boring, perfectly
+    legal move would have defused it. (Observed in practice: 22.b4 Qh2#,
+    where 22.b4 ignored an already-available ...Qh2# and plenty of other
+    legal 22nd moves for White would have prevented it.)
+
+    Cheap: one push/find_immediate_mate/pop per legal move, same cost
+    class as find_immediate_mate itself.
+
+    Returns [] if every legal move allows an immediate mate reply (i.e.
+    mate is unavoidable next move regardless of what's played now) --
+    callers should fall back to normal move selection in that case, since
+    there is nothing safer to prefer.
+    """
+    safe = []
+    for move in board.legal_moves:
+        board.push(move)
+        opponent_can_mate = find_immediate_mate(board) is not None
+        board.pop()
+        if not opponent_can_mate:
+            safe.append(move)
+    return safe
+
+
+def pick_safe_move_from_visits(board: chess.Board, visits: dict, temperature: float) -> str:
+    """Like pick_move_from_visits, but for deterministic (temperature ~0)
+    play only: screens out any candidate move that would hand the
+    opponent an immediate mate-in-1, using find_safe_moves() as a
+    last-line safety net on top of whatever MCTS itself concluded.
+
+    Only engages for temperature <= 1e-3 (real, deterministic play) --
+    self-play's temperature>0 exploratory sampling is left untouched, so
+    this doesn't change what the value/policy heads get trained on.
+
+    Falls back to the plain visit-count choice whenever there's nothing
+    better to do: if the search's own top pick is already safe, if none
+    of the moves MCTS actually visited are safe (falls back to any safe
+    legal move it didn't happen to visit, if one exists), or if literally
+    every legal move allows a mate reply (a real unavoidable mate -- no
+    override can fix that).
+    """
+    best_uci = pick_move_from_visits(visits, temperature)
+    if temperature > 1e-3:
+        return best_uci
+
+    best_move = chess.Move.from_uci(best_uci)
+    board.push(best_move)
+    in_danger = find_immediate_mate(board) is not None
+    board.pop()
+    if not in_danger:
+        return best_uci
+
+    safe_moves = find_safe_moves(board)
+    if not safe_moves:
+        return best_uci  # mate is unavoidable regardless -- nothing to do
+
+    safe_ucis = {m.uci() for m in safe_moves}
+    safe_visited = {uci: n for uci, n in visits.items() if uci in safe_ucis}
+    if safe_visited:
+        # Prefer the safe move search itself gave the most weight to.
+        return max(safe_visited, key=safe_visited.get)
+    # None of the moves MCTS actually visited happen to be safe (can
+    # happen with very few sims/legal moves) -- better an unsearched
+    # safe move than a searched one that loses outright.
+    return safe_moves[0].uci()
+
+
 # ----------------------------------------------------------------------
 # Replay buffer
 # ----------------------------------------------------------------------
@@ -711,7 +787,7 @@ def tournament(proc, model_a, model_b, n_games: int, sims: int, threads: int,
 
             CURRENT_MODEL = white_model if board.turn == chess.WHITE else black_model
             visits, _ = search(proc, board, sims=sims, threads=threads)
-            best_uci = pick_move_from_visits(visits, temperature=0.0)
+            best_uci = pick_safe_move_from_visits(board, visits, temperature=0.0)
             move = chess.Move.from_uci(best_uci)
             assert move in board.legal_moves, (
                 f"ILLEGAL MOVE during tournament: {best_uci} at FEN '{board.fen()}'"

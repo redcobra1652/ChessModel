@@ -106,12 +106,17 @@ def parse_eval_to_z(comment: str, eval_scale: float) -> float | None:
     quality broadcast games, or the very first ply before any move has
     been played and analyzed).
 
-    Centipawn scores are squashed with tanh(pawns / eval_scale) -- a
-    simple monotonic approximation of engine-eval-to-win-probability, not
-    a calibrated one. Mate scores saturate to +-MATE_SATURATION_Z rather
-    than +-1.0 exactly, since a value head trained on exact +-1 targets
-    (unreachable by tanh) sees needlessly large gradients trying to
-    approach them.
+    Lichess broadcast PGNs express evals in PAWN units (e.g. [%eval 0.34]
+    means 0.34 pawns, not 34 centipawns). The default eval_scale=1.0 is
+    calibrated for this: tanh(0.34 / 1.0) = 0.33, tanh(1.0 / 1.0) = 0.76,
+    tanh(3.0 / 1.0) = 0.995 -- a sensible spread across [-1, 1].
+
+    If your PGN source uses centipawn units instead (e.g. [%eval 34] for
+    the same advantage), pass --eval-scale 100.0 to compensate.
+
+    Mate scores saturate to +-MATE_SATURATION_Z rather than +-1.0 exactly,
+    since a value head trained on exact +-1 targets (unreachable by tanh)
+    sees needlessly large gradients trying to approach them.
     """
     if not comment:
         return None
@@ -201,7 +206,7 @@ def resolve_pgn_paths(pgn_arg: list[str]) -> list[str]:
 
 def iter_examples(pgn_paths: list[str], skip_bots: bool, min_elo: int | None,
                    value_target: str = "outcome", eval_weight: float = 0.5,
-                   eval_scale: float = 400.0):
+                   eval_scale: float = 1.0):
     """Yields (state, policy_idx, z, quality_penalty) for every position in
     every game across every file in pgn_paths, streaming game-by-game (and
     file-by-file) so nothing ever has to sit fully in memory. `state` is a
@@ -455,11 +460,11 @@ def main():
                          help="Weight on the eval-derived target vs. the outcome-"
                               "derived target when --value-target=blend (0=pure "
                               "outcome, 1=pure eval). Ignored otherwise.")
-    parser.add_argument("--eval-scale", type=float, default=400.0,
-                         help="Divisor (in pawns) used to squash centipawn evals to "
-                              "[-1, 1] via tanh(pawns / eval_scale) for --value-target "
-                              "eval/blend. Lower = more saturated/confident targets "
-                              "from smaller advantages; higher = flatter/gentler.")
+    parser.add_argument("--eval-scale", type=float, default=1.0,
+                         help="Divisor used to squash evals to [-1, 1] via tanh(eval / eval_scale) "
+                              "for --value-target eval/blend. Default 1.0 is correct for Lichess "
+                              "broadcast PGNs, which express evals in pawn units (e.g. [%%eval 0.34]). "
+                              "Use 100.0 if your PGN source uses centipawn units (e.g. [%%eval 34]).")
     parser.add_argument("--include-bots", action="store_true",
                          help="Include engine-vs-human games (skipped by default).")
     parser.add_argument("--max-examples", type=int, default=None,

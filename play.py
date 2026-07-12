@@ -90,13 +90,16 @@ Sound files are expected at:
 """
 
 import argparse
+import glob
 import os
 import queue
+import stat
 import sys
 import threading
 import time
 
 import chess
+import chess.engine
 import chess.pgn
 import pygame
 import torch
@@ -726,12 +729,20 @@ def draw_analysis(screen, font, big_font, move_analysis, scroll):
 # Eval bar (chess.com-style vertical bar to the left of the board)
 # ----------------------------------------------------------------------
 
-def draw_eval_bar(screen, eval_font, eval_white, show, human_is_white):
-    """`eval_white` is the model's static value estimate in [-1, 1] from
-    White's perspective (+1 = White winning). The bar always fills from
+def draw_eval_bar(screen, eval_font, eval_white, show, human_is_white, thinking=False):
+    """`eval_white` is the model's value estimate in [-1, 1] from White's
+    perspective (+1 = White winning) -- either a real search result (after
+    the model's own move) or a cheap static read (right after the human's
+    move, before the model's search has run). The bar always fills from
     whichever edge the human's own side occupies, matching the board's
     orientation, so it reads naturally no matter which color you're
-    playing."""
+    playing.
+
+    While `thinking` is True, the model's search is running but hasn't
+    produced a new value yet -- the number on screen is still the reading
+    from before the human's move landed, about to be superseded. It's
+    dimmed and suffixed with "..." so it reads as "last known, not final"
+    rather than looking like a live, trustworthy figure."""
     rect = pygame.Rect(0, 0, EVAL_BAR_W, BOARD_PX)
     pygame.draw.rect(screen, EVAL_BAR_BG, rect)
 
@@ -740,19 +751,21 @@ def draw_eval_bar(screen, eval_font, eval_white, show, human_is_white):
 
     ev = max(-1.0, min(1.0, eval_white))
     white_fraction = (ev + 1.0) / 2.0  # 0..1
+    fill_color = tuple(int(c * 0.55) for c in EVAL_WHITE_COLOR) if thinking else EVAL_WHITE_COLOR
 
     if human_is_white:
         # human (White) sits at the bottom -> White's share fills upward from the bottom
         white_h = int(BOARD_PX * white_fraction)
-        pygame.draw.rect(screen, EVAL_WHITE_COLOR, (0, BOARD_PX - white_h, EVAL_BAR_W, white_h))
+        pygame.draw.rect(screen, fill_color, (0, BOARD_PX - white_h, EVAL_BAR_W, white_h))
     else:
         # human (Black) sits at the bottom -> Black's share fills upward from the bottom
         black_fraction = 1.0 - white_fraction
         black_h = int(BOARD_PX * black_fraction)
-        pygame.draw.rect(screen, EVAL_WHITE_COLOR, (0, 0, EVAL_BAR_W, BOARD_PX - black_h))
+        pygame.draw.rect(screen, fill_color, (0, 0, EVAL_BAR_W, BOARD_PX - black_h))
 
-    text = f"{ev:+.2f}"
-    label = eval_font.render(text, True, (225, 225, 225))
+    text = f"{ev:+.2f}{'...' if thinking else ''}"
+    label_color = (170, 170, 170) if thinking else (225, 225, 225)
+    label = eval_font.render(text, True, label_color)
     label_bg_y = 6
     bg_rect = pygame.Rect(2, label_bg_y - 2, EVAL_BAR_W - 4, label.get_height() + 4)
     pygame.draw.rect(screen, (0, 0, 0, 120), bg_rect, border_radius=4)
@@ -798,6 +811,173 @@ def prompt_promotion(screen, clock, images, color, background_draw_fn):
 
 
 # ----------------------------------------------------------------------
+# Stockfish / endgame generation helpers
+# ----------------------------------------------------------------------
+
+def find_stockfish_binary_play(stockfish_dir="stockfish"):
+    """Locate the best Stockfish binary under stockfish_dir.
+    Same heuristic as stockfish_train.py."""
+    import platform
+
+    def _is_exec(p):
+        if not os.path.isfile(p):
+            return False
+        s = os.stat(p)
+        return bool(s.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+
+    def _score(name):
+        name = name.lower()
+        sc = 0
+        m = platform.machine().lower()
+        apple = "apple-silicon" in name or "m1" in name or "arm64" in name
+        x86   = "x86-64" in name or "x86_64" in name
+        if m in ("arm64", "aarch64"):
+            sc += 100 if apple else (-50 if x86 else 0)
+        else:
+            sc += 100 if x86 else (-100 if apple else 0)
+        for feat, bonus in [("avx512",40),("vnni",35),("bmi2",30),
+                             ("avx2",25),("sse41-popcnt",10),("sse41",5)]:
+            if feat in name:
+                sc += bonus
+                break
+        if name == "stockfish":
+            sc += 15
+        if name.endswith((".nnue",".zip",".tar")):
+            sc -= 1000
+        return sc
+
+    candidates = [p for p in glob.glob(
+        os.path.join(stockfish_dir, "**", "stockfish*"), recursive=True)
+        if _is_exec(p)]
+    if not candidates:
+        return None
+    candidates.sort(key=_score, reverse=True)
+    return candidates[0]
+
+
+def generate_endgame_position(stockfish_dir="stockfish",
+                               target_pieces=8,
+                               movetime_ms=50,
+                               max_moves=200):
+    """
+    Let two Stockfish@1320 bots play each other from the opening until
+    the total piece count (excluding kings) drops to target_pieces or
+    fewer, then return that board position as a FEN string.
+    """
+    sf_path = find_stockfish_binary_play(stockfish_dir)
+    if sf_path is None:
+        print(f"Warning: no Stockfish binary found under '{stockfish_dir}'. "
+              f"Starting from the opening position instead.")
+        return None
+
+    limit = chess.engine.Limit(time=movetime_ms / 1000.0)
+
+    try:
+        sf1 = chess.engine.SimpleEngine.popen_uci(sf_path)
+        sf2 = chess.engine.SimpleEngine.popen_uci(sf_path)
+        for sf in (sf1, sf2):
+            sf.configure({"UCI_LimitStrength": True, "UCI_Elo": 1320})
+    except Exception as e:
+        print(f"Warning: could not start Stockfish for endgame generation: {e}")
+        return None
+
+    board = chess.Board()
+    result_fen = None
+
+    try:
+        for _ in range(max_moves):
+            if board.is_game_over(claim_draw=True):
+                break
+
+            non_kings = sum(1 for sq in chess.SQUARES
+                            if board.piece_at(sq) is not None
+                            and board.piece_at(sq).piece_type != chess.KING)
+            if non_kings <= target_pieces:
+                result_fen = board.fen()
+                break
+
+            sf = sf1 if board.turn == chess.WHITE else sf2
+            try:
+                res = sf.play(board, limit)
+                board.push(res.move)
+            except Exception:
+                break
+    finally:
+        sf1.quit()
+        sf2.quit()
+
+    if result_fen is None and not board.is_game_over(claim_draw=True):
+        result_fen = board.fen()
+
+    return result_fen
+
+
+# Home screen colors
+_HOME_BG        = (24, 26, 30)
+_HOME_TITLE     = (235, 235, 235)
+_HOME_SUBTITLE  = (140, 145, 155)
+_BTN_NORMAL_BG  = (48, 52, 60)
+_BTN_HOVER_BG   = (68, 74, 88)
+_BTN_BORDER     = (80, 88, 105)
+_BTN_TEXT       = (235, 235, 235)
+_BTN_ACCENT_BG  = (50, 100, 180)
+_BTN_ACCENT_HOV = (65, 120, 210)
+_SPINNER_COLOR  = (100, 150, 230)
+
+_HOME_BTN_W   = 340
+_HOME_BTN_H   = 58
+_HOME_BTN_GAP = 18
+
+
+def draw_home_screen(screen, font, big_font, title_font, buttons, hovered,
+                     loading=False, loading_text="Generating endgame..."):
+    """
+    Draw the home screen with the given buttons list.
+    Each button is a dict: {"label": str, "sublabel": str, "rect": pygame.Rect,
+                             "accent": bool}
+    hovered: index of the currently-hovered button, or None.
+    loading: if True, show a spinner/loading message instead of buttons.
+    """
+    screen.fill(_HOME_BG)
+
+    cx = WINDOW_W // 2
+
+    title_surf = title_font.render("Chess vs Model", True, _HOME_TITLE)
+    screen.blit(title_surf, (cx - title_surf.get_width() // 2, 120))
+
+    sub_surf = font.render("Choose how to start", True, _HOME_SUBTITLE)
+    screen.blit(sub_surf, (cx - sub_surf.get_width() // 2, 170))
+
+    if loading:
+        dots = "." * ((pygame.time.get_ticks() // 400) % 4)
+        msg = font.render(loading_text + dots, True, _SPINNER_COLOR)
+        screen.blit(msg, (cx - msg.get_width() // 2, WINDOW_H // 2 - 12))
+        return
+
+    for i, btn in enumerate(buttons):
+        rect = btn["rect"]
+        is_hov = (hovered == i)
+        if btn.get("accent"):
+            bg = _BTN_ACCENT_HOV if is_hov else _BTN_ACCENT_BG
+        else:
+            bg = _BTN_HOVER_BG if is_hov else _BTN_NORMAL_BG
+
+        pygame.draw.rect(screen, bg, rect, border_radius=10)
+        pygame.draw.rect(screen, _BTN_BORDER, rect, width=1, border_radius=10)
+
+        label_surf = big_font.render(btn["label"], True, _BTN_TEXT)
+        screen.blit(label_surf,
+                    (rect.centerx - label_surf.get_width() // 2,
+                     rect.centery - label_surf.get_height() // 2 - 8))
+
+        if btn.get("sublabel"):
+            sub = font.render(btn["sublabel"], True, _HOME_SUBTITLE)
+            screen.blit(sub,
+                        (rect.centerx - sub.get_width() // 2,
+                         rect.centery + label_surf.get_height() // 2 - 6))
+
+
+# ----------------------------------------------------------------------
 # Model-thinking background worker
 # ----------------------------------------------------------------------
 
@@ -828,7 +1008,12 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue):
             result_queue.put(("ok", {"uci": best_uci, "visits": {best_uci: 1}, "value": 1.0}))
             return
         visits, value = train.search(proc, board_snapshot, sims=sims, threads=threads)
-        best_uci = train.pick_move_from_visits(visits, temperature=0.0)
+        # pick_safe_move_from_visits screens out any top pick that would
+        # hand the human an immediate mate-in-1 reply (see train.py) --
+        # a defensive counterpart to the mate_move check above, which
+        # only ever covers the engine's OWN mating chances, never
+        # whether its choice lets the opponent mate back next move.
+        best_uci = train.pick_safe_move_from_visits(board_snapshot, visits, temperature=0.0)
         result_queue.put(("ok", {"uci": best_uci, "visits": visits, "value": value}))
     except Exception as e:  # surface engine crashes to the GUI instead of hanging it
         result_queue.put(("error", str(e)))
@@ -906,17 +1091,18 @@ class Game:
 
         self.reset_game()
 
-    def reset_game(self, human_is_white=None):
+    def reset_game(self, human_is_white=None, start_fen=None):
         """Starts a fresh game. `human_is_white`, if given, switches which
         color the human plays (used by the "Rematch as White/Black"
         popup buttons); omitted (e.g. pressing 'r'), it keeps whatever
-        color was just being played."""
+        color was just being played. `start_fen`, if given, starts from
+        that FEN instead of the standard opening position."""
         if human_is_white is not None and human_is_white != self.human_is_white:
             self.human_is_white = human_is_white
             self.flipped = not self.human_is_white
             self.board_bg = self._board_backgrounds["white" if self.human_is_white else "black"]
 
-        self.board = chess.Board()
+        self.board = chess.Board(start_fen) if start_fen else chess.Board()
         self.selected_square = None
         self.legal_targets = []
         self.dragging_square = None
@@ -946,17 +1132,42 @@ class Game:
     def legal_moves_from(self, square):
         return [m for m in self.board.legal_moves if m.from_square == square]
 
-    def compute_eval(self):
-        """Static (non-search) model value-head estimate for the current
-        position, converted to White's perspective for the eval bar. Cheap
-        single forward pass -- separate from, and safe to call alongside,
-        the model's own MCTS search running on the worker thread."""
+    def compute_eval(self, search_value_white=None):
+        """Updates the eval bar for the current position, converted to
+        White's perspective.
+
+        Terminal positions (checkmate/draw) are always resolved exactly,
+        regardless of any value passed in.
+
+        Otherwise, if `search_value_white` is given, it's used as-is: this
+        is the real root value the model's own MCTS search (hundreds of
+        sims) just produced for the move it chose, which is what should
+        drive the eval bar after the MODEL moves -- it's strictly more
+        informed than a fresh network read of the resulting position
+        would be, and (critically) it's the number the engine actually
+        acted on, so the bar never shows something the search itself
+        disagreed with. Previously this always re-derived the eval from
+        scratch via a static, zero-lookahead single forward pass -- which
+        cannot see even a one-ply mate threat -- so the bar could show
+        "White is winning" moments after the model's own search-backed
+        move, right when the position was actually lost. See
+        pick_safe_move_from_visits in train.py for the complementary fix
+        to the move selection itself.
+
+        If `search_value_white` is None (the human just moved, so no
+        fresh search result exists yet), falls back to the previous
+        behavior: a cheap static single-pass network read -- a rough
+        "first impression" of the position shown while the model's real
+        search hasn't started yet."""
         if self.board.is_checkmate():
             loser_is_white = self.board.turn == chess.WHITE
             self.eval_white = -1.0 if loser_is_white else 1.0
             return
         if self.board.is_game_over(claim_draw=True):
             self.eval_white = 0.0
+            return
+        if search_value_white is not None:
+            self.eval_white = search_value_white
             return
         try:
             _, _, value = train.nn_eval(self.board, is_root=False)
@@ -992,9 +1203,14 @@ class Game:
         self.push_move(move, mover_is_human=True)
         return True
 
-    def push_move(self, move, mover_is_human):
+    def push_move(self, move, mover_is_human, search_value_white=None):
         """Applies `move` to the live board, updates history/highlights, and
-        plays the appropriate chess.com-style sound for what just happened."""
+        plays the appropriate chess.com-style sound for what just happened.
+
+        `search_value_white` (model moves only) is the model's own real
+        search value for the move just played, already converted to
+        White's perspective -- see compute_eval() for why this is
+        preferred over a fresh static re-evaluation."""
         is_capture = self.board.is_capture(move)
         is_castle = self.board.is_castling(move)
         is_promo = move.promotion is not None
@@ -1004,7 +1220,7 @@ class Game:
         self.san_history.append(san)
         self.last_move = move
         self.moves_scroll = 0  # auto-follow the latest move
-        self.compute_eval()
+        self.compute_eval(search_value_white=None if mover_is_human else search_value_white)
         is_checkmate = self.board.is_checkmate()
         is_check = self.board.is_check()
         game_over_now = self.board.is_game_over(claim_draw=True)
@@ -1065,11 +1281,18 @@ class Game:
             self.result_text = f"Engine error: {payload}"
             return
         move = chess.Move.from_uci(payload["uci"])
+        # Root value is from the mover's own perspective (see
+        # position_outcome/nn_eval in train.py); convert to White's
+        # perspective once here, before self.board.turn flips, and reuse
+        # it both for the analysis panel and the eval bar so they always
+        # agree with each other and with what the search actually found.
+        mover_is_white = self.board.turn == chess.WHITE
+        search_value_white = payload["value"] if mover_is_white else -payload["value"]
         # Must run before push_move: it needs self.board (and self.board.san)
         # in the pre-move position to label the chosen move and its
         # candidates, and push_move mutates self.board in place.
         self.record_model_analysis(move, payload["visits"], payload["value"])
-        self.push_move(move, mover_is_human=False)
+        self.push_move(move, mover_is_human=False, search_value_white=search_value_white)
 
     def record_model_analysis(self, move, visits, value):
         """Captures how the model's search evaluated the position it just
@@ -1335,7 +1558,7 @@ class Game:
     def draw_frame(self):
         self.screen.fill((0, 0, 0))
         draw_eval_bar(self.screen, self.eval_font, self.eval_white, self.show_eval_bar,
-                      self.human_is_white)
+                      self.human_is_white, thinking=self.thinking)
         draw_board(self.screen, self.board_bg, self.board, self.images, self.flipped,
                    self.selected_square, self.legal_targets, self.last_move,
                    self.dragging_square, self.premoves, self.premove_selected_square)
@@ -1356,6 +1579,286 @@ class Game:
                 self.screen, self.font, self.big_font, self.move_analysis, self.analysis_scroll)
 
 
+# ----------------------------------------------------------------------
+# Set Up Position screen
+# ----------------------------------------------------------------------
+
+# Palette of piece types the user can place, listed in the sidebar.
+_SETUP_PIECES = [
+    (chess.WHITE, chess.KING),
+    (chess.WHITE, chess.QUEEN),
+    (chess.WHITE, chess.ROOK),
+    (chess.WHITE, chess.BISHOP),
+    (chess.WHITE, chess.KNIGHT),
+    (chess.WHITE, chess.PAWN),
+    (chess.BLACK, chess.KING),
+    (chess.BLACK, chess.QUEEN),
+    (chess.BLACK, chess.ROOK),
+    (chess.BLACK, chess.BISHOP),
+    (chess.BLACK, chess.KNIGHT),
+    (chess.BLACK, chess.PAWN),
+]
+
+_SETUP_BG     = (28, 30, 36)
+_SETUP_SB_BG  = (34, 36, 40)
+_SETUP_LABEL  = (200, 205, 215)
+_SETUP_HINT   = (120, 125, 135)
+_SETUP_ERR    = (220, 80, 80)
+_SETUP_OK     = (80, 200, 120)
+
+
+def _run_setup_screen(screen, clock, font, big_font, title_font,
+                      images, sounds, board_backgrounds, args):
+    """
+    Interactive board editor. The user drags pieces from a sidebar palette
+    onto the board (or drags existing board pieces around). Right-click
+    removes a piece. 'Start as White' / 'Start as Black' buttons validate
+    the position and return its FEN. The illegal sound plays if the
+    position is invalid when either Start button is clicked.
+
+    Returns the chosen FEN string (with args.color updated), or None if
+    the user closed the window / pressed Q.
+    """
+    # Start from the standard opening position so the user has a full
+    # board to edit rather than an empty one.
+    setup_board = chess.Board()
+
+    flipped = False  # perspective toggle (Tab key)
+
+    # Piece being dragged: either picked from the sidebar palette or
+    # lifted from the board itself.
+    drag_piece      = None   # chess.Piece or None
+    drag_from_sq    = None   # source square if lifted from board, else None
+    drag_mouse_pos  = (0, 0)
+
+    # Sidebar palette geometry
+    sb_pad   = 14
+    sb_x     = SIDEBAR_X
+    sb_w     = SIDEBAR_W
+    cell     = SQUARE  # palette cells are the same size as board squares
+
+    # Two rows of 6 pieces (white on top, black below)
+    palette_cols = 6
+    palette_cell = (sb_w - 2 * sb_pad) // palette_cols
+
+    def palette_rect(idx):
+        col = idx % palette_cols
+        row = idx // palette_cols
+        x = sb_x + sb_pad + col * palette_cell
+        y = 70 + row * palette_cell
+        return pygame.Rect(x, y, palette_cell, palette_cell)
+
+    # Button geometry
+    btn_w, btn_h = 124, 40
+    btn_gap      = 12
+    btn_y        = WINDOW_H - btn_h - 16
+    btn_white = pygame.Rect(sb_x + sb_pad,
+                             btn_y, btn_w, btn_h)
+    btn_black = pygame.Rect(sb_x + sb_pad + btn_w + btn_gap,
+                             btn_y, btn_w, btn_h)
+    btn_clear = pygame.Rect(sb_x + sb_pad,
+                             btn_y - btn_h - 8, btn_w * 2 + btn_gap, btn_h - 8)
+    btn_flip  = pygame.Rect(sb_x + sb_pad,
+                             btn_y - 2 * (btn_h + 8), btn_w * 2 + btn_gap, btn_h - 8)
+
+    error_msg = ""
+
+    def draw_setup():
+        screen.fill(_SETUP_BG)
+
+        # Board background
+        bg_key = "black" if flipped else "white"
+        screen.blit(board_backgrounds[bg_key], (BOARD_X, 0))
+
+        # Pieces on board
+        for sq in chess.SQUARES:
+            if sq == drag_from_sq:
+                continue
+            piece = setup_board.piece_at(sq)
+            if piece is None:
+                continue
+            px, py = square_to_pixel(sq, flipped)
+            screen.blit(images[(piece.color, piece.piece_type)],
+                        (px + PIECE_OFFSET, py + PIECE_OFFSET))
+
+        # Sidebar background
+        pygame.draw.rect(screen, _SETUP_SB_BG, (sb_x, 0, sb_w, WINDOW_H))
+
+        # Title
+        t = big_font.render("Set Up Position", True, _SETUP_LABEL)
+        screen.blit(t, (sb_x + sb_pad, 16))
+        h = font.render("Drag pieces onto the board", True, _SETUP_HINT)
+        screen.blit(h, (sb_x + sb_pad, 44))
+
+        # Palette
+        for idx, (color, pt) in enumerate(_SETUP_PIECES):
+            r = palette_rect(idx)
+            pygame.draw.rect(screen, (50, 54, 64), r, border_radius=6)
+            img = images[(color, pt)]
+            scaled = pygame.transform.smoothscale(img, (palette_cell - 6, palette_cell - 6))
+            screen.blit(scaled, (r.x + 3, r.y + 3))
+
+        # Hint text below palette
+        hint_y = 70 + 2 * palette_cell + 8
+        for line in ["Right-click board to remove piece",
+                     "Tab = flip board"]:
+            surf = font.render(line, True, _SETUP_HINT)
+            screen.blit(surf, (sb_x + sb_pad, hint_y))
+            hint_y += 20
+
+        mouse_pos = pygame.mouse.get_pos()
+
+        # Flip / Clear buttons
+        for rect, label in ((btn_flip, "Flip Board"), (btn_clear, "Clear Board")):
+            hov = rect.collidepoint(mouse_pos)
+            pygame.draw.rect(screen, (68, 74, 88) if hov else (48, 52, 60),
+                             rect, border_radius=8)
+            pygame.draw.rect(screen, (80, 88, 105), rect, width=1, border_radius=8)
+            s = font.render(label, True, (235, 235, 235))
+            screen.blit(s, s.get_rect(center=rect.center))
+
+        # Start buttons
+        for rect, label, col in (
+            (btn_white, "Start as White", _BTN_ACCENT_BG),
+            (btn_black, "Start as Black", (60, 60, 72)),
+        ):
+            hov = rect.collidepoint(mouse_pos)
+            bg = tuple(min(255, c + 20) for c in col) if hov else col
+            pygame.draw.rect(screen, bg, rect, border_radius=8)
+            pygame.draw.rect(screen, (80, 88, 105), rect, width=1, border_radius=8)
+            s = font.render(label, True, (235, 235, 235))
+            screen.blit(s, s.get_rect(center=rect.center))
+
+        # Error / status message
+        if error_msg:
+            err_surf = font.render(error_msg, True, _SETUP_ERR)
+            screen.blit(err_surf, (sb_x + sb_pad, btn_y - 28))
+
+        # Dragged piece follows the cursor
+        if drag_piece is not None:
+            img = images[(drag_piece.color, drag_piece.piece_type)]
+            rect = img.get_rect(center=drag_mouse_pos)
+            screen.blit(img, rect)
+
+    def try_start(human_color):
+        """Validate and return FEN, or None + set error_msg on failure."""
+        nonlocal error_msg
+        # Temporarily set the turn to match the human's chosen color so
+        # the FEN is consistent (setup board always has the same turn).
+        test_board = setup_board.copy()
+        test_board.turn = chess.WHITE if human_color == "white" else chess.BLACK
+        # Remove invalid en-passant / castling rights that don't match
+        # the edited position.
+        test_board.clear_stack()
+        try:
+            test_board.set_castling_fen(
+                _infer_castling(test_board))
+        except Exception:
+            test_board.castling_rights = chess.BB_EMPTY
+        test_board.ep_square = None
+        if test_board.status() != chess.STATUS_VALID:
+            sounds.get("illegal") and sounds["illegal"].play()
+            error_msg = "Illegal position — fix it first"
+            return None
+        error_msg = ""
+        return test_board.fen()
+
+    def _infer_castling(board):
+        """Re-derive castling rights from piece positions (kings & rooks
+        on their home squares, since the setup editor doesn't track
+        whether they've moved)."""
+        rights = ""
+        if (board.piece_at(chess.E1) == chess.Piece(chess.KING, chess.WHITE)):
+            if board.piece_at(chess.H1) == chess.Piece(chess.ROOK, chess.WHITE):
+                rights += "K"
+            if board.piece_at(chess.A1) == chess.Piece(chess.ROOK, chess.WHITE):
+                rights += "Q"
+        if (board.piece_at(chess.E8) == chess.Piece(chess.KING, chess.BLACK)):
+            if board.piece_at(chess.H8) == chess.Piece(chess.ROOK, chess.BLACK):
+                rights += "k"
+            if board.piece_at(chess.A8) == chess.Piece(chess.ROOK, chess.BLACK):
+                rights += "q"
+        return rights or "-"
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return None
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_q:
+                    return None
+                elif event.key == pygame.K_TAB:
+                    flipped = not flipped
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = event.pos
+                drag_mouse_pos = event.pos
+
+                if event.button == 3:  # right-click removes a board piece
+                    sq = pixel_to_square(event.pos, flipped)
+                    if sq is not None:
+                        setup_board.remove_piece_at(sq)
+
+                elif event.button == 1:
+                    # Check UI buttons first
+                    if btn_white.collidepoint(event.pos):
+                        fen = try_start("white")
+                        if fen:
+                            args.color = "white"
+                            return fen
+                        continue
+                    if btn_black.collidepoint(event.pos):
+                        fen = try_start("black")
+                        if fen:
+                            args.color = "black"
+                            return fen
+                        continue
+                    if btn_clear.collidepoint(event.pos):
+                        setup_board.clear()
+                        error_msg = ""
+                        continue
+                    if btn_flip.collidepoint(event.pos):
+                        flipped = not flipped
+                        continue
+
+                    # Palette pick-up
+                    for idx, (color, pt) in enumerate(_SETUP_PIECES):
+                        r = palette_rect(idx)
+                        if r.collidepoint(event.pos):
+                            drag_piece    = chess.Piece(pt, color)
+                            drag_from_sq  = None
+                            break
+                    else:
+                        # Board pick-up
+                        sq = pixel_to_square(event.pos, flipped)
+                        if sq is not None and setup_board.piece_at(sq) is not None:
+                            drag_piece   = setup_board.piece_at(sq)
+                            drag_from_sq = sq
+                            setup_board.remove_piece_at(sq)
+
+            elif event.type == pygame.MOUSEMOTION:
+                drag_mouse_pos = event.pos
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if drag_piece is not None:
+                    sq = pixel_to_square(event.pos, flipped)
+                    if sq is not None:
+                        # Place piece (replaces whatever was there)
+                        setup_board.set_piece_at(sq, drag_piece)
+                    elif drag_from_sq is not None:
+                        # Dropped outside the board: put it back
+                        setup_board.set_piece_at(drag_from_sq, drag_piece)
+                    drag_piece   = None
+                    drag_from_sq = None
+
+        draw_setup()
+        pygame.display.flip()
+        clock.tick(60)
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Play chess against a trained model (GUI).")
     parser.add_argument("--model", type=str, default=train.BEST_MODEL_PATH,
@@ -1372,6 +1875,11 @@ def main():
                               "(e.g. assets/black_king.png, assets/checkboard_white.png).")
     parser.add_argument("--sounds", type=str, default="sound",
                          help="Folder containing sound effect .mp3 files (e.g. sound/capture.mp3).")
+    parser.add_argument("--stockfish-dir", type=str, default="stockfish",
+                        help="Directory containing Stockfish binary (for endgame generation).")
+    parser.add_argument("--endgame-pieces", type=int, default=8,
+                        help="Target non-king piece count for endgame positions (default 8). "
+                             "Lower = simpler endgame.")
     args = parser.parse_args()
 
     train.setup_logging()
@@ -1398,26 +1906,160 @@ def main():
     pygame.init()
     pygame.mixer.init()
     pygame.display.set_caption("Chess vs Model")
-    # RESIZABLE lets the user drag the window to any size; SCALED keeps
-    # all of the drawing code above working at its fixed logical
-    # resolution (WINDOW_W x WINDOW_H) while pygame automatically scales
-    # that to whatever the actual window/display size is -- including
-    # fullscreen (toggled below with F11) -- and automatically translates
-    # mouse event coordinates back into logical space, so none of the
-    # click hit-testing elsewhere needs to change.
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE | pygame.SCALED)
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("arial", 18)
-    big_font = pygame.font.SysFont("arial", 26, bold=True)
-    eval_font = pygame.font.SysFont("arial", 14, bold=True)
+    font       = pygame.font.SysFont("arial", 18)
+    big_font   = pygame.font.SysFont("arial", 26, bold=True)
+    eval_font  = pygame.font.SysFont("arial", 14, bold=True)
+    title_font = pygame.font.SysFont("arial", 42, bold=True)
 
-    images = load_piece_images(args.assets)
-    sounds = load_sounds(args.sounds)
+    images            = load_piece_images(args.assets)
+    sounds            = load_sounds(args.sounds)
     board_backgrounds = load_board_backgrounds(args.assets)
 
-    game = Game(args, screen, font, big_font, eval_font, images, sounds, board_backgrounds, proc)
+    # ----------------------------------------------------------------
+    # Home screen button layout
+    # ----------------------------------------------------------------
+    cx = WINDOW_W // 2
+    btn_x = cx - _HOME_BTN_W // 2
+    btn_y_start = 230
+
+    home_buttons = [
+        {
+            "label":    "Play Normal Game",
+            "sublabel": "Start from the opening position",
+            "rect":     pygame.Rect(btn_x, btn_y_start, _HOME_BTN_W, _HOME_BTN_H),
+            "accent":   True,
+            "mode":     "normal",
+        },
+        {
+            "label":    "Set Up Position",
+            "sublabel": "Drag pieces to any square, then start vs model",
+            "rect":     pygame.Rect(btn_x,
+                                    btn_y_start + (_HOME_BTN_H + _HOME_BTN_GAP),
+                                    _HOME_BTN_W, _HOME_BTN_H),
+            "accent":   False,
+            "mode":     "setup",
+        },
+        {
+            "label":    "Play Endgame (as White)",
+            "sublabel": "Two bots simplify to an endgame, you play White",
+            "rect":     pygame.Rect(btn_x,
+                                    btn_y_start + 2 * (_HOME_BTN_H + _HOME_BTN_GAP),
+                                    _HOME_BTN_W, _HOME_BTN_H),
+            "accent":   False,
+            "mode":     "endgame_white",
+        },
+        {
+            "label":    "Play Endgame (as Black)",
+            "sublabel": "Two bots simplify to an endgame, you play Black",
+            "rect":     pygame.Rect(btn_x,
+                                    btn_y_start + 3 * (_HOME_BTN_H + _HOME_BTN_GAP),
+                                    _HOME_BTN_W, _HOME_BTN_H),
+            "accent":   False,
+            "mode":     "endgame_black",
+        },
+    ]
+
+    # ----------------------------------------------------------------
+    # Home screen loop
+    # ----------------------------------------------------------------
+    chosen_mode = None
+    loading     = False
+    endgame_fen = None
+    gen_thread  = None
+    gen_result  = [None]
 
     try:
+        in_home = True
+        while in_home:
+            mouse_pos = pygame.mouse.get_pos()
+            hovered   = None
+            for i, btn in enumerate(home_buttons):
+                if btn["rect"].collidepoint(mouse_pos):
+                    hovered = i
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    train.shutdown_engine(proc)
+                    return
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+                    pygame.quit()
+                    train.shutdown_engine(proc)
+                    return
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if not loading:
+                        for btn in home_buttons:
+                            if btn["rect"].collidepoint(event.pos):
+                                chosen_mode = btn["mode"]
+                                if chosen_mode in ("endgame_white", "endgame_black"):
+                                    loading = True
+                                    def _gen(result_box, sf_dir, n_pieces):
+                                        result_box[0] = generate_endgame_position(
+                                            stockfish_dir=sf_dir,
+                                            target_pieces=n_pieces,
+                                            movetime_ms=50,
+                                        )
+                                    gen_thread = threading.Thread(
+                                        target=_gen,
+                                        args=(gen_result, args.stockfish_dir,
+                                              args.endgame_pieces),
+                                        daemon=True,
+                                    )
+                                    gen_thread.start()
+                                else:
+                                    in_home = False
+                                break
+
+            if loading and gen_thread is not None and not gen_thread.is_alive():
+                endgame_fen = gen_result[0]
+                loading     = False
+                in_home     = False
+
+            draw_home_screen(screen, font, big_font, title_font,
+                             home_buttons, hovered, loading=loading)
+            pygame.display.flip()
+            clock.tick(60)
+
+        # ----------------------------------------------------------------
+        # Set Up Position mode: interactive board editor before the game
+        # ----------------------------------------------------------------
+        setup_fen = None
+        if chosen_mode == "setup":
+            setup_fen = _run_setup_screen(
+                screen, clock, font, big_font, title_font,
+                images, sounds, board_backgrounds, args,
+            )
+            if setup_fen is None:
+                # User quit during setup
+                pygame.quit()
+                train.shutdown_engine(proc)
+                return
+
+        # ----------------------------------------------------------------
+        # Determine start FEN and color from chosen mode
+        # ----------------------------------------------------------------
+        if chosen_mode == "setup":
+            start_fen = setup_fen
+            # color already set by the setup screen (stored in args.color)
+        else:
+            start_fen = endgame_fen  # None for normal game
+
+        if chosen_mode == "endgame_white":
+            args.color = "white"
+        elif chosen_mode == "endgame_black":
+            args.color = "black"
+
+        # ----------------------------------------------------------------
+        # Build game and start the main game loop
+        # ----------------------------------------------------------------
+        game = Game(args, screen, font, big_font, eval_font,
+                    images, sounds, board_backgrounds, proc)
+
+        if start_fen is not None:
+            game.reset_game(start_fen=start_fen)
+
         running = True
         while running:
             for event in pygame.event.get():
@@ -1448,6 +2090,7 @@ def main():
             game.draw_frame()
             pygame.display.flip()
             clock.tick(60)
+
     finally:
         pygame.quit()
         train.shutdown_engine(proc)
