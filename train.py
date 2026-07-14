@@ -358,7 +358,7 @@ def position_outcome(board: chess.Board):
 # Engine request handlers (Python side of the protocol)
 # ----------------------------------------------------------------------
 
-def _replay(history: list, path: list = (), start_fen: str = None) -> chess.Board:
+def _replay(history: list, path: list = ()) -> chess.Board:
     """Reconstructs a board by replaying real moves from the game start.
 
     This is the crux of correct repetition handling: a board built from a
@@ -369,15 +369,8 @@ def _replay(history: list, path: list = (), start_fen: str = None) -> chess.Boar
     both the terminal check below and the repetition-count feature in
     board_to_tensor work correctly, including for hypothetical lines deep
     inside the search tree (via `path`), not just the real game.
-
-    `start_fen`: when the game started from a custom position (e.g. an
-    endgame or a user-set-up position), pass the root FEN here so _replay
-    uses it as the base instead of the standard starting position. History
-    moves are then replayed on top of that base, and repetition detection
-    works correctly for moves made during this game (though prior history
-    before the custom position is naturally unknowable and absent).
     """
-    board = chess.Board(start_fen) if start_fen else chess.Board()
+    board = chess.Board()
     for uci in history:
         board.push_uci(uci)
     for uci in path:
@@ -385,41 +378,32 @@ def _replay(history: list, path: list = (), start_fen: str = None) -> chess.Boar
     return board
 
 
-_SAFE_TERMINAL = {"terminal": True, "result": 0.0, "moves": [], "priors": [], "value": 0.0}
+def handle_root(history: list) -> dict:
+    board = _replay(history)
+    terminal, result = position_outcome(board)
+    if terminal:
+        return {"terminal": True, "result": result, "moves": [], "priors": [], "value": result}
+    moves, priors, value = nn_eval(board, is_root=True)
+    return {"terminal": False, "result": 0.0, "moves": moves, "priors": priors, "value": value}
 
 
-def handle_root(history: list, start_fen: str = None) -> dict:
-    try:
-        board = _replay(history, start_fen=start_fen)
-        terminal, result = position_outcome(board)
-        if terminal:
-            return {"terminal": True, "result": result, "moves": [], "priors": [], "value": result}
-        moves, priors, value = nn_eval(board, is_root=True)
-        return {"terminal": False, "result": 0.0, "moves": moves, "priors": priors, "value": value}
-    except Exception as e:
-        log.warning(f"handle_root error (returning safe terminal): {e}")
-        return _SAFE_TERMINAL
-
-
-def handle_visit(history: list, path: list, move_uci: str, start_fen: str = None) -> dict:
-    try:
-        board = _replay(history, path, start_fen=start_fen)
-        move = chess.Move.from_uci(move_uci)
-        if move not in board.legal_moves:
-            log.warning(f"Illegal move from engine: {move_uci} at {board.fen()} — returning safe terminal")
-            return {"fen": board.fen(), **_SAFE_TERMINAL}
-        board.push(move)
-        child_fen = board.fen()
-        terminal, result = position_outcome(board)
-        if terminal:
-            return {"fen": child_fen, "terminal": True, "result": result,
-                    "moves": [], "priors": [], "value": result}
-        moves, priors, value = nn_eval(board, is_root=False)
-        return {"fen": child_fen, "terminal": False, "result": 0.0,
-                "moves": moves, "priors": priors, "value": value}
-    except Exception as e:
-        log.warning(f"handle_visit error (returning safe terminal): {e}")
-        return {"fen": "", **_SAFE_TERMINAL}
+def handle_visit(history: list, path: list, move_uci: str) -> dict:
+    board = _replay(history, path)
+    move = chess.Move.from_uci(move_uci)
+    # --- Safety check: the engine must never request an illegal move ---
+    assert move in board.legal_moves, (
+        f"ILLEGAL MOVE requested by mcts_engine: {move_uci} at FEN '{board.fen()}'. "
+        f"Legal moves were: {[m.uci() for m in board.legal_moves]}"
+    )
+    board.push(move)
+    child_fen = board.fen()
+    terminal, result = position_outcome(board)
+    if terminal:
+        return {"fen": child_fen, "terminal": True, "result": result,
+                "moves": [], "priors": [], "value": result}
+    moves, priors, value = nn_eval(board, is_root=False)
+    return {"fen": child_fen, "terminal": False, "result": 0.0,
+            "moves": moves, "priors": priors, "value": value}
 
 
 ENGINE_READ_TIMEOUT_SECS = 120  # generous margin above any real per-request cost
@@ -457,18 +441,6 @@ def search(proc, board: chess.Board, sims: int, threads: int):
     threads: exactly one side is ever blocked waiting on the other.
     """
     history = [m.uci() for m in board.move_stack]
-    # Detect a non-standard starting position: if the board has no move
-    # history but isn't the standard start, we need to pass the root FEN
-    # so _replay() can reconstruct positions correctly during the search.
-    # For boards WITH history we walk back to the root via undo to find
-    # the true starting FEN, then restore the board.
-    if board.move_stack:
-        temp = board.copy(stack=True)
-        while temp.move_stack:
-            temp.pop()
-        start_fen = None if temp.fen() == chess.STARTING_FEN else temp.fen()
-    else:
-        start_fen = None if board.fen() == chess.STARTING_FEN else board.fen()
     proc.stdin.write(json.dumps({
         "cmd": "search", "fen": board.fen(), "sims": sims, "threads": threads,
         "history": history,
@@ -483,26 +455,18 @@ def search(proc, board: chess.Board, sims: int, threads: int):
         line = line.strip()
         if not line:
             continue
-
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError as e:
-            log.warning(f"Malformed JSON from engine (skipping): {e} -- line={line[:120]!r}")
-            continue
+        obj = json.loads(line)
 
         if obj.get("cmd") == "result":
             visits = dict(zip(obj["moves"], obj["visits"]))
             return visits, obj["value"]
 
         if obj.get("type") == "root":
-            resp = handle_root(obj.get("history", []), start_fen=start_fen)
+            resp = handle_root(obj.get("history", []))
         elif obj.get("type") == "visit":
-            resp = handle_visit(obj.get("history", []), obj.get("path", []), obj["move"], start_fen=start_fen)
+            resp = handle_visit(obj.get("history", []), obj.get("path", []), obj["move"])
         else:
-            # Engine echoed something unexpected (e.g. our own response bounced
-            # back). Write a safe terminal so engine is never left waiting.
-            log.warning(f"Unexpected engine message (sending safe terminal): {line[:120]!r}")
-            resp = _SAFE_TERMINAL
+            raise RuntimeError(f"Unknown message from engine: {line}")
 
         proc.stdin.write(json.dumps(resp) + "\n")
         proc.stdin.flush()
@@ -601,51 +565,34 @@ def pick_safe_move_from_visits(board: chess.Board, visits: dict, temperature: fl
 # ----------------------------------------------------------------------
 
 class ReplayBuffer:
-    """Splits examples into decisive (z != 0) and drawn (z == 0) pools so
-    that sample() can cap how much of a batch is draws.
+    """Simple FIFO replay buffer, capped at `capacity` total examples.
 
-    This exists because of a real failure mode: when self-play produces a
-    run of repetition-heavy games, the buffer can fill up almost entirely
-    with z=0 examples. MSE loss on a target that's mostly 0 pushes the
-    value head toward just predicting ~0 for everything -- collapse --
-    which then makes the search *worse* at telling a winning line from a
-    repetition-inviting one, producing more draws, compounding the
-    problem. Capping the draw fraction keeps decisive outcomes (which are
-    the only signal that actually teaches "this is winning/losing") a
-    meaningful share of every gradient step regardless of how skewed the
-    raw buffer currently is.
+    Note: an earlier version of this buffer split examples into decisive
+    (z != 0) and drawn (z == 0) pools and capped how much of each training
+    batch could be draws, as a guard against a self-play repetition-spiral
+    failure mode. That cap was removed because this buffer is populated by
+    Stockfish-vs-Stockfish self-play at a fixed Elo, not the model's own
+    self-play -- two real engines occasionally drawing via genuine
+    equal-position repetition or the 50-move rule is expected, rational
+    behavior, not the runaway degenerate pattern the cap was designed to
+    guard against. Sampling is now uniform across all stored examples.
     """
 
-    def __init__(self, capacity: int, max_draw_fraction: float = 0.5):
-        self.decisive = collections.deque(maxlen=capacity)
-        self.draws = collections.deque(maxlen=capacity)
-        self.max_draw_fraction = max_draw_fraction
+    def __init__(self, capacity: int):
+        self.buffer = collections.deque(maxlen=capacity)
 
     def push(self, state: np.ndarray, policy: np.ndarray, value: float):
-        if value == 0.0:
-            self.draws.append((state, policy, value))
-        else:
-            self.decisive.append((state, policy, value))
+        self.buffer.append((state, policy, value))
 
     def __len__(self):
-        return len(self.decisive) + len(self.draws)
+        return len(self.buffer)
 
     def sample(self, batch_size: int):
-        n = min(batch_size, len(self))
+        n = min(batch_size, len(self.buffer))
         if n == 0:
             raise ValueError("ReplayBuffer.sample called on an empty buffer")
 
-        n_draw = min(int(round(n * self.max_draw_fraction)), len(self.draws))
-        n_decisive = n - n_draw
-        if n_decisive > len(self.decisive):
-            # Not enough decisive examples yet (e.g. very early in
-            # training) -- backfill with extra draws rather than shrinking
-            # the batch below what was requested.
-            n_decisive = len(self.decisive)
-            n_draw = min(n - n_decisive, len(self.draws))
-
-        batch = random.sample(self.draws, n_draw) + random.sample(self.decisive, n_decisive)
-        random.shuffle(batch)
+        batch = random.sample(self.buffer, n)
         states, policies, values = zip(*batch)
         states_t = torch.from_numpy(np.stack(states)).float()
         policies_t = torch.from_numpy(np.stack(policies)).float()
@@ -882,22 +829,12 @@ def main():
     parser.add_argument("--max-moves", type=int, default=150, help="Ply cap per game before declaring a draw.")
     parser.add_argument("--temp-moves", type=int, default=15, help="Plies of temperature=1.0 exploration before playing greedily.")
     parser.add_argument("--buffer-size", type=int, default=50000)
-    parser.add_argument("--max-draw-fraction", type=float, default=0.5,
-                         help="Cap on the fraction of every training batch that can be "
-                              "drawn (z=0) examples. Prevents a run of repetition-heavy "
-                              "self-play games from flooding the value target with 0s and "
-                              "collapsing the value head toward always predicting ~0. Only "
-                              "effective once the buffer actually has decisive examples to "
-                              "fill the rest of the batch with -- see --min-decisive-for-training.")
     parser.add_argument("--min-decisive-for-training", type=int, default=50,
-                         help="Minimum number of decisive (z != 0) examples that must be in "
-                              "the replay buffer before a generation is allowed to train at "
-                              "all. Below this, --max-draw-fraction can't do its job (there's "
-                              "nothing to backfill with), so a generation would train on a "
-                              "buffer that's ~100%% draws and collapse the value head straight "
-                              "back to predicting ~0 -- exactly the failure this whole run is "
-                              "trying to recover from. Self-play keeps going and games keep "
-                              "accumulating in the buffer; training just waits.")
+                         help="Minimum number of decisive (non-draw) games' worth of examples "
+                              "that must have been added before a generation is allowed to "
+                              "train at all. Note: with the simplified ReplayBuffer this is now "
+                              "an approximate self-play-games-based heuristic, not an exact "
+                              "buffer count -- see the check below.")
     parser.add_argument("--stall-warn-generations", type=int, default=5,
                          help="If this many consecutive generations get skipped for lack of "
                               "decisive examples, log a warning -- this means self-play itself "
@@ -927,7 +864,7 @@ def main():
     best_model.eval()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    buffer = ReplayBuffer(args.buffer_size, max_draw_fraction=args.max_draw_fraction)
+    buffer = ReplayBuffer(args.buffer_size)
 
     global CURRENT_MODEL, CURRENT_DEVICE
     CURRENT_DEVICE = device
@@ -936,6 +873,8 @@ def main():
     generation = 0
     new_examples_since_train = 0
     consecutive_training_skips = 0
+    decisive_examples_seen = 0  # running counts, not buffer-derived, since
+    drawn_examples_seen = 0     # ReplayBuffer no longer splits decisive/draws
 
     try:
         pbar = tqdm(total=args.games, desc="Self-play games")
@@ -948,6 +887,10 @@ def main():
                                       args.temp_moves, game_index=games_played)
             for state, policy_target, z in examples:
                 buffer.push(state, policy_target, z)
+                if z == 0.0:
+                    drawn_examples_seen += 1
+                else:
+                    decisive_examples_seen += 1
             new_examples_since_train += len(examples)
 
             games_played += 1
@@ -965,19 +908,18 @@ def main():
                     consecutive_training_skips += 1
                     continue
 
-                # Guard against the exact collapse this run is recovering from:
-                # --max-draw-fraction can only cap draws in a batch if there are
-                # enough decisive examples to fill the rest of it. Early on (or
-                # after a fresh value-head reset), self-play can go many games
-                # without a single decisive result -- if a generation trained on
-                # that buffer anyway, it would be ~100% z=0 targets regardless of
-                # the cap, and would collapse the value head right back to
-                # predicting ~0 before it ever saw a real win/loss. So: keep
-                # playing self-play games and accumulating buffer, but don't
-                # spend a training step until there's real decisive signal to
-                # train on.
-                if len(buffer.decisive) < args.min_decisive_for_training:
-                    log.info(f"Only {len(buffer.decisive)} decisive example(s) in buffer "
+                # Guard against training on an all-draw buffer before any
+                # decisive self-play result has come in. NOTE: this now uses
+                # cumulative running counts (decisive_examples_seen), not a
+                # live buffer.decisive count -- the simplified ReplayBuffer
+                # doesn't track that split, and old examples can be evicted
+                # from the buffer as new ones arrive. This is a reasonable
+                # proxy for "has self-play produced real signal yet" but is
+                # no longer an exact count of what's currently in the
+                # buffer. (This whole main() is currently unused -- only
+                # stockfish_train.py is run -- kept coherent for future use.)
+                if decisive_examples_seen < args.min_decisive_for_training:
+                    log.info(f"Only {decisive_examples_seen} decisive example(s) seen so far "
                               f"(need {args.min_decisive_for_training}); skipping training "
                               f"this generation so the value head isn't trained on an "
                               f"all-draw batch. Self-play continues.")
@@ -985,12 +927,12 @@ def main():
                     if consecutive_training_skips == args.stall_warn_generations:
                         log.warning(
                             f"{consecutive_training_skips} consecutive generations skipped for "
-                            f"lack of decisive examples (buffer has {len(buffer.decisive)} "
-                            f"decisive / {len(buffer.draws)} drawn). This isn't just a slow "
-                            f"start anymore -- self-play itself is producing almost nothing but "
-                            f"draws, which --min-decisive-for-training can't fix on its own. "
-                            f"Consider: increasing --sims (deeper search finds decisive lines "
-                            f"more often), checking --max-moves isn't cutting games off too "
+                            f"lack of decisive examples ({decisive_examples_seen} "
+                            f"decisive / {drawn_examples_seen} drawn seen so far). This isn't "
+                            f"just a slow start anymore -- self-play itself is producing almost "
+                            f"nothing but draws, which --min-decisive-for-training can't fix on "
+                            f"its own. Consider: increasing --sims (deeper search finds decisive "
+                            f"lines more often), checking --max-moves isn't cutting games off too "
                             f"early, or checking resign/repetition behavior isn't itself buggy."
                         )
                     continue

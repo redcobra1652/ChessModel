@@ -87,6 +87,7 @@ from tqdm import tqdm
 
 import train  # reuse DualHeadResNet, ReplayBuffer, train_step, search, board/move helpers
 from eval_game_logger import run_eval_batch_with_pgn  # noqa: E402 -- adds PGN sample saving on top of run_eval_batch
+from endgame_data import generate_endgame_batch  # noqa: E402 -- synthetic K+Q/K+R/K+2R vs K mating-technique data
 
 FALLBACK_MIN_ELO = 1320
 FALLBACK_MAX_ELO = 3190
@@ -656,6 +657,14 @@ def main():
     parser.add_argument("--sims", type=int, default=400)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--max-moves", type=int, default=200)
+    parser.add_argument("--endgame-positions-per-gen", type=int, default=40,
+                         help="Synthetic K+Q/K+R/K+2R vs K positions to generate and train on each generation. 0 disables.")
+    parser.add_argument("--endgame-max-moves", type=int, default=40,
+                         help="Move cap for synthetic endgame games (trivial for full-strength Stockfish; should resolve fast).")
+    parser.add_argument("--endgame-teacher-movetime-ms", type=int, default=None,
+                         help="Per-move time limit for the full-strength Stockfish teacher during synthetic endgame generation. If unset, uses --endgame-teacher-depth instead.")
+    parser.add_argument("--endgame-teacher-depth", type=int, default=None,
+                         help="Search depth for the full-strength Stockfish teacher during synthetic endgame generation. If both this and --endgame-teacher-movetime-ms are set, depth wins (see make_limit). If neither is set, defaults to depth=12.")
     parser.add_argument("--stockfish-dir", type=str, default="stockfish")
     parser.add_argument("--stockfish-path", type=str, default=None)
     parser.add_argument("--stockfish-threads", type=int, default=1)
@@ -706,7 +715,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--buffer-size", type=int, default=50000)
-    parser.add_argument("--max-draw-fraction", type=float, default=0.5)
     parser.add_argument("--trajectory-log", type=str, default=TRAJECTORY_LOG_DEFAULT)
     parser.add_argument("--buffer-path", type=str, default="replay_buffer.pkl",
                          help="Path to persist/restore the replay buffer across restarts. "
@@ -766,19 +774,30 @@ def main():
     model.eval()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    buffer = train.ReplayBuffer(args.buffer_size, max_draw_fraction=args.max_draw_fraction)
+    buffer = train.ReplayBuffer(args.buffer_size)
 
     if args.buffer_path and os.path.exists(args.buffer_path):
         try:
             with open(args.buffer_path, "rb") as f:
                 saved = pickle.load(f)
-            # Restore deque contents respecting the (possibly new) capacity.
-            for item in saved["decisive"]:
-                buffer.decisive.append(item)
-            for item in saved["draws"]:
-                buffer.draws.append(item)
-            log.info(f"Restored replay buffer from '{args.buffer_path}': "
-                     f"{len(buffer.decisive)} decisive + {len(buffer.draws)} drawn = {len(buffer)} examples.")
+            if "decisive" in saved or "draws" in saved:
+                # Backward-compatible load: old buffer format from before
+                # the decisive/draws split was removed. Merge both pools
+                # into the new unified deque (order doesn't matter --
+                # sampling is uniform now).
+                n_loaded = 0
+                for item in saved.get("decisive", []):
+                    buffer.buffer.append(item)
+                    n_loaded += 1
+                for item in saved.get("draws", []):
+                    buffer.buffer.append(item)
+                    n_loaded += 1
+                log.info(f"Restored replay buffer from '{args.buffer_path}' (old decisive/draws "
+                         f"format, merged into unified buffer): {len(buffer)} examples.")
+            else:
+                for item in saved.get("buffer", []):
+                    buffer.buffer.append(item)
+                log.info(f"Restored replay buffer from '{args.buffer_path}': {len(buffer)} examples.")
         except Exception as e:
             log.warning(f"Could not load replay buffer from '{args.buffer_path}': {e}. Starting fresh.")
 
@@ -865,6 +884,20 @@ def main():
                 buffer.push(state, policy_target, z)
             log.info(f"Generation {generation}: {len(new_examples)} new examples (buffer size {len(buffer)}).")
 
+            if args.endgame_positions_per_gen > 0:
+                endgame_depth = args.endgame_teacher_depth
+                if endgame_depth is None and args.endgame_teacher_movetime_ms is None:
+                    endgame_depth = 12  # preserve old default when neither flag is passed
+                endgame_teacher_limit = make_limit(args.endgame_teacher_movetime_ms, endgame_depth)
+                endgame_examples = generate_endgame_batch(
+                    sf_teacher, endgame_teacher_limit,
+                    n_positions=args.endgame_positions_per_gen,
+                    max_moves=args.endgame_max_moves,
+                    desc=f"Gen {generation} synthetic endgames")
+                for state, policy_target, z in endgame_examples:
+                    buffer.push(state, policy_target, z)
+                log.info(f"Generation {generation}: +{len(endgame_examples)} synthetic endgame examples (buffer size {len(buffer)}).")
+
             if len(buffer) < args.batch_size:
                 log.info("Replay buffer smaller than one batch; skipping training this generation.")
                 model.eval()
@@ -916,8 +949,7 @@ def main():
                 if args.buffer_path:
                     try:
                         with open(args.buffer_path, "wb") as f:
-                            pickle.dump({"decisive": list(buffer.decisive),
-                                         "draws": list(buffer.draws)}, f)
+                            pickle.dump({"buffer": list(buffer.buffer)}, f)
                         log.info(f"Saved replay buffer to '{args.buffer_path}' "
                                  f"({len(buffer)} examples).")
                     except Exception as e:
@@ -989,8 +1021,7 @@ def main():
         if args.buffer_path and len(buffer) > 0:
             try:
                 with open(args.buffer_path, "wb") as f:
-                    pickle.dump({"decisive": list(buffer.decisive),
-                                 "draws": list(buffer.draws)}, f)
+                    pickle.dump({"buffer": list(buffer.buffer)}, f)
                 log.info(f"Saved replay buffer on exit to '{args.buffer_path}' "
                          f"({len(buffer)} examples).")
             except Exception as e:
