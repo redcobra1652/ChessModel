@@ -214,16 +214,18 @@ EVAL_TOGGLE_W, EVAL_TOGGLE_H = 46, 24
 EVAL_TOGGLE_RECT = pygame.Rect(SIDEBAR_X + SIDEBAR_W - 18 - EVAL_TOGGLE_W, WINDOW_H - 44,
                                 EVAL_TOGGLE_W, EVAL_TOGGLE_H)
 
-# End-of-game popup: centered over the whole window, with "Copy PGN" and
-# "Analysis" side by side on the top row, and "Rematch as White" /
-# "Rematch as Black" side by side below them.
-POPUP_W, POPUP_H = 420, 270
+# End-of-game popup: centered over the whole window.
+# Row 1: Copy PGN | Analysis
+# Row 2: Rematch as White | Rematch as Black
+# Row 3: Home Menu (full-width, centered)
+POPUP_W, POPUP_H = 420, 330
 POPUP_RECT = pygame.Rect((WINDOW_W - POPUP_W) // 2, (WINDOW_H - POPUP_H) // 2, POPUP_W, POPUP_H)
 POPUP_BTN_W, POPUP_BTN_H = 170, 46
 POPUP_BTN_GAP = 20
 POPUP_ROW_GAP = 14
 
-_popup_row2_y = POPUP_RECT.bottom - 30 - POPUP_BTN_H
+_popup_row3_y = POPUP_RECT.bottom - 28 - POPUP_BTN_H
+_popup_row2_y = _popup_row3_y - POPUP_ROW_GAP - POPUP_BTN_H
 _popup_row1_y = _popup_row2_y - POPUP_ROW_GAP - POPUP_BTN_H
 _popup_row_total_w = POPUP_BTN_W * 2 + POPUP_BTN_GAP
 _popup_row_x0 = POPUP_RECT.left + (POPUP_W - _popup_row_total_w) // 2
@@ -234,6 +236,14 @@ POPUP_ANALYSIS_BTN_RECT = pygame.Rect(_popup_row_x0 + POPUP_BTN_W + POPUP_BTN_GA
 REMATCH_WHITE_BTN_RECT = pygame.Rect(_popup_row_x0, _popup_row2_y, POPUP_BTN_W, POPUP_BTN_H)
 REMATCH_BLACK_BTN_RECT = pygame.Rect(_popup_row_x0 + POPUP_BTN_W + POPUP_BTN_GAP, _popup_row2_y,
                                       POPUP_BTN_W, POPUP_BTN_H)
+# Full-width Home Menu button
+_home_btn_w = _popup_row_total_w
+HOME_MENU_BTN_RECT = pygame.Rect(_popup_row_x0, _popup_row3_y, _home_btn_w, POPUP_BTN_H)
+
+# Sidebar "Resign" button — shown during play, above the Analysis/Eval row.
+RESIGN_BTN_W, RESIGN_BTN_H = SIDEBAR_W - 36, 30
+RESIGN_BTN_RECT = pygame.Rect(SIDEBAR_X + 18, WINDOW_H - 44 - 1 - RESIGN_BTN_H - 10,
+                               RESIGN_BTN_W, RESIGN_BTN_H)
 
 # Sidebar "Analysis" button (opens the full-window move-analysis panel),
 # drawn next to the "Eval Sidebar" toggle at the bottom of the right
@@ -549,6 +559,8 @@ def draw_popup(screen, font, big_font, result_text, pgn_copied):
                 REMATCH_WHITE_BTN_RECT.collidepoint(mouse_pos))
     draw_button(screen, font, REMATCH_BLACK_BTN_RECT, "Rematch as Black",
                 REMATCH_BLACK_BTN_RECT.collidepoint(mouse_pos))
+    draw_button(screen, font, HOME_MENU_BTN_RECT, "Home Menu",
+                HOME_MENU_BTN_RECT.collidepoint(mouse_pos))
 
     if pgn_copied:
         note = font.render("PGN copied to clipboard!", True, (140, 220, 150))
@@ -567,9 +579,17 @@ def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
     y += 40
 
     you_are = "White" if human_is_white else "Black"
+    max_text_w = SIDEBAR_W - 2 * pad
+    def _fit(text):
+        """Truncate `text` with ellipsis so it fits within max_text_w."""
+        if font.size(text)[0] <= max_text_w:
+            return text
+        while len(text) > 1 and font.size(text + "…")[0] > max_text_w:
+            text = text[:-1]
+        return text + "…"
     info_lines = [
         f"You: {you_are}",
-        f"Model: {os.path.basename(model_name)}",
+        _fit(f"Model: {os.path.basename(model_name)}"),
     ]
     for line in info_lines:
         screen.blit(font.render(line, True, SIDEBAR_SUBTEXT), (SIDEBAR_X + pad, y))
@@ -635,8 +655,18 @@ def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
         hint = font.render("v more moves below", True, SIDEBAR_SUBTEXT)
         screen.blit(hint, (SIDEBAR_X + pad, min(y, EVAL_TOGGLE_RECT.top - 22)))
 
-    # Analysis button, pinned near the bottom-left of the right panel.
+    # Resign button — only shown while the game is still in progress.
     mouse_pos = pygame.mouse.get_pos()
+    if not result_text:
+        resign_hov = RESIGN_BTN_RECT.collidepoint(mouse_pos)
+        pygame.draw.rect(screen,
+                         (120, 48, 48) if resign_hov else (80, 36, 36),
+                         RESIGN_BTN_RECT, border_radius=7)
+        pygame.draw.rect(screen, (160, 70, 70), RESIGN_BTN_RECT, width=1, border_radius=7)
+        r_label = font.render("Resign", True, (240, 200, 200))
+        screen.blit(r_label, r_label.get_rect(center=RESIGN_BTN_RECT.center))
+
+    # Analysis button, pinned near the bottom-left of the right panel.
     draw_button(screen, font, ANALYSIS_BTN_RECT, "Analysis", ANALYSIS_BTN_RECT.collidepoint(mouse_pos))
 
     # Eval sidebar toggle, pinned near the bottom of the right panel.
@@ -1049,6 +1079,8 @@ class Game:
         self.last_move = None
         self.san_history = []
         self.result_text = None
+        self.go_home = False
+        self.go_home = False
         self.moves_scroll = 0  # 0 = pinned to the latest move
         self.moves_max_scroll = 0
 
@@ -1430,6 +1462,8 @@ class Game:
             self.reset_game(human_is_white=True)
         elif REMATCH_BLACK_BTN_RECT.collidepoint(pos):
             self.reset_game(human_is_white=False)
+        elif HOME_MENU_BTN_RECT.collidepoint(pos):
+            self.go_home = True
 
     # ---------------- game analysis overlay ----------------
 
@@ -1449,6 +1483,10 @@ class Game:
 
         if ANALYSIS_BTN_RECT.collidepoint(pos):
             self.show_analysis = True
+            return
+
+        if self.result_text is None and RESIGN_BTN_RECT.collidepoint(pos):
+            self.result_text = "You resigned."
             return
 
         if self.result_text is not None:
@@ -1962,134 +2000,134 @@ def main():
     ]
 
     # ----------------------------------------------------------------
-    # Home screen loop
+    # Home screen + game outer loop
     # ----------------------------------------------------------------
-    chosen_mode = None
-    loading     = False
-    endgame_fen = None
-    gen_thread  = None
-    gen_result  = [None]
-
     try:
-        in_home = True
-        while in_home:
-            mouse_pos = pygame.mouse.get_pos()
-            hovered   = None
-            for i, btn in enumerate(home_buttons):
-                if btn["rect"].collidepoint(mouse_pos):
-                    hovered = i
+        in_outer = True
+        while in_outer:
+            # Reset per-session state each time we return to home
+            chosen_mode = None
+            loading     = False
+            endgame_fen = None
+            gen_thread  = None
+            gen_result  = [None]
 
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    train.shutdown_engine(proc)
-                    return
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
-                    pygame.quit()
-                    train.shutdown_engine(proc)
-                    return
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if not loading:
-                        for btn in home_buttons:
-                            if btn["rect"].collidepoint(event.pos):
-                                chosen_mode = btn["mode"]
-                                if chosen_mode in ("endgame_white", "endgame_black"):
-                                    loading = True
-                                    def _gen(result_box, sf_dir, n_pieces):
-                                        result_box[0] = generate_endgame_position(
-                                            stockfish_dir=sf_dir,
-                                            target_pieces=n_pieces,
-                                            movetime_ms=50,
+            # ── Home screen ──────────────────────────────────────────
+            in_home = True
+            while in_home:
+                mouse_pos = pygame.mouse.get_pos()
+                hovered   = None
+                for i, btn in enumerate(home_buttons):
+                    if btn["rect"].collidepoint(mouse_pos):
+                        hovered = i
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        train.shutdown_engine(proc)
+                        return
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+                        pygame.quit()
+                        train.shutdown_engine(proc)
+                        return
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        if not loading:
+                            for btn in home_buttons:
+                                if btn["rect"].collidepoint(event.pos):
+                                    chosen_mode = btn["mode"]
+                                    if chosen_mode in ("endgame_white", "endgame_black"):
+                                        loading = True
+                                        def _gen(result_box, sf_dir, n_pieces):
+                                            result_box[0] = generate_endgame_position(
+                                                stockfish_dir=sf_dir,
+                                                target_pieces=n_pieces,
+                                                movetime_ms=50,
+                                            )
+                                        gen_thread = threading.Thread(
+                                            target=_gen,
+                                            args=(gen_result, args.stockfish_dir,
+                                                  args.endgame_pieces),
+                                            daemon=True,
                                         )
-                                    gen_thread = threading.Thread(
-                                        target=_gen,
-                                        args=(gen_result, args.stockfish_dir,
-                                              args.endgame_pieces),
-                                        daemon=True,
-                                    )
-                                    gen_thread.start()
-                                else:
-                                    in_home = False
-                                break
+                                        gen_thread.start()
+                                    else:
+                                        in_home = False
+                                    break
 
-            if loading and gen_thread is not None and not gen_thread.is_alive():
-                endgame_fen = gen_result[0]
-                loading     = False
-                in_home     = False
+                if loading and gen_thread is not None and not gen_thread.is_alive():
+                    endgame_fen = gen_result[0]
+                    loading     = False
+                    in_home     = False
 
-            draw_home_screen(screen, font, big_font, title_font,
-                             home_buttons, hovered, loading=loading)
-            pygame.display.flip()
-            clock.tick(60)
+                draw_home_screen(screen, font, big_font, title_font,
+                                 home_buttons, hovered, loading=loading)
+                pygame.display.flip()
+                clock.tick(60)
 
-        # ----------------------------------------------------------------
-        # Set Up Position mode: interactive board editor before the game
-        # ----------------------------------------------------------------
-        setup_fen = None
-        if chosen_mode == "setup":
-            setup_fen = _run_setup_screen(
-                screen, clock, font, big_font, title_font,
-                images, sounds, board_backgrounds, args,
-            )
-            if setup_fen is None:
-                # User quit during setup
-                pygame.quit()
-                train.shutdown_engine(proc)
-                return
+            # ── Set Up Position mode ─────────────────────────────────
+            setup_fen = None
+            if chosen_mode == "setup":
+                setup_fen = _run_setup_screen(
+                    screen, clock, font, big_font, title_font,
+                    images, sounds, board_backgrounds, args,
+                )
+                if setup_fen is None:
+                    # User quit during setup — go back to home
+                    continue
 
-        # ----------------------------------------------------------------
-        # Determine start FEN and color from chosen mode
-        # ----------------------------------------------------------------
-        if chosen_mode == "setup":
-            start_fen = setup_fen
-            # color already set by the setup screen (stored in args.color)
-        else:
-            start_fen = endgame_fen  # None for normal game
+            # ── Determine start FEN and color ────────────────────────
+            if chosen_mode == "setup":
+                start_fen = setup_fen
+            else:
+                start_fen = endgame_fen  # None for normal game
 
-        if chosen_mode == "endgame_white":
-            args.color = "white"
-        elif chosen_mode == "endgame_black":
-            args.color = "black"
+            if chosen_mode == "endgame_white":
+                args.color = "white"
+            elif chosen_mode == "endgame_black":
+                args.color = "black"
 
-        # ----------------------------------------------------------------
-        # Build game and start the main game loop
-        # ----------------------------------------------------------------
-        game = Game(args, screen, font, big_font, eval_font,
-                    images, sounds, board_backgrounds, proc)
+            # ── Build game and run game loop ─────────────────────────
+            game = Game(args, screen, font, big_font, eval_font,
+                        images, sounds, board_backgrounds, proc)
 
-        if start_fen is not None:
-            game.reset_game(start_fen=start_fen)
+            if start_fen is not None:
+                game.reset_game(start_fen=start_fen)
 
-        running = True
-        while running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    game.handle_mousedown(event.pos)
-                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    game.handle_mouseup(event.pos)
-                elif event.type == pygame.MOUSEWHEEL:
-                    if game.show_analysis:
-                        game.scroll_analysis(event.y)
-                    elif pygame.mouse.get_pos()[0] >= SIDEBAR_X:
-                        game.scroll_moves(event.y)
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_q:
-                        running = False
-                    elif event.key == pygame.K_r and game.result_text is not None:
-                        game.reset_game()
-                    elif event.key == pygame.K_F11:
-                        pygame.display.toggle_fullscreen()
-                    elif event.key == pygame.K_a:
-                        game.show_analysis = not game.show_analysis
-                    elif event.key == pygame.K_ESCAPE and game.show_analysis:
-                        game.show_analysis = False
+            game_running = True
+            while game_running:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        game_running = False
+                        in_outer = False
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        game.handle_mousedown(event.pos)
+                    elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                        game.handle_mouseup(event.pos)
+                    elif event.type == pygame.MOUSEWHEEL:
+                        if game.show_analysis:
+                            game.scroll_analysis(event.y)
+                        elif pygame.mouse.get_pos()[0] >= SIDEBAR_X:
+                            game.scroll_moves(event.y)
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_q:
+                            game_running = False
+                            in_outer = False
+                        elif event.key == pygame.K_r and game.result_text is not None:
+                            game.reset_game()
+                        elif event.key == pygame.K_F11:
+                            pygame.display.toggle_fullscreen()
+                        elif event.key == pygame.K_a:
+                            game.show_analysis = not game.show_analysis
+                        elif event.key == pygame.K_ESCAPE and game.show_analysis:
+                            game.show_analysis = False
 
-            game.poll_model_move()
-            game.draw_frame()
-            pygame.display.flip()
-            clock.tick(60)
+                if game.go_home:
+                    game_running = False   # break back to outer home loop
+
+                game.poll_model_move()
+                game.draw_frame()
+                pygame.display.flip()
+                clock.tick(60)
 
     finally:
         pygame.quit()

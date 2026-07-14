@@ -27,6 +27,8 @@ stockfish/
 replay_buffer.pkl
 # warm-train PGN datasets
 warm_train/*.pgn
+# all PGN files anywhere in the repo
+*.pgn
 
 # ── PyTorch model checkpoints ──────────────────────────────────────────────────
 # Ignore all .pt / .pth / .ckpt checkpoint files by default …

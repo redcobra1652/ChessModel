@@ -1,6 +1,6 @@
 // mcts.cpp
 //
-// Minimal, self-contained, multi-threaded AlphaZero-style MCTS engine.
+// Minimal, self-contained, single-threaded AlphaZero-style MCTS engine.
 //
 // This process is a long-lived "MCTS server". It is started once by
 // train.py and reused for every self-play / evaluation move for the
@@ -37,9 +37,7 @@
 // message schema above is fixed and simple.
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -47,7 +45,6 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 // ----------------------------------------------------------------------
@@ -534,17 +531,16 @@ int main(int argc, char** argv) {
             root->fen = fen;
             root->history = cmd.count("history") ? cmd["history"].arr_s : std::vector<std::string>{};
 
-            std::atomic<int> remaining(sims);
-            std::vector<std::thread> pool;
-            pool.reserve(nthreads);
-            for (int t = 0; t < nthreads; ++t) {
-                pool.emplace_back([&]() {
-                    while (remaining.fetch_sub(1) > 0) {
-                        simulate_one(root.get());
-                    }
-                });
+            // All simulations run on THIS thread (the main thread that owns
+            // stdin/stdout). Running them in a thread pool was a deadlock:
+            // each sim calls send_request() which does blocking I/O, but
+            // main() was also blocked on std::getline -- so the worker
+            // threads' requests were landing in main()'s getline and being
+            // treated as unknown top-level commands. Serial execution here
+            // is correct; MCTS is inherently sequential through the pipe.
+            for (int i = 0; i < sims; ++i) {
+                simulate_one(root.get());
             }
-            for (auto& th : pool) th.join();
 
             std::vector<std::string> moves;
             std::vector<double> visits;

@@ -86,6 +86,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import train  # reuse DualHeadResNet, ReplayBuffer, train_step, search, board/move helpers
+from eval_game_logger import run_eval_batch_with_pgn  # noqa: E402 -- adds PGN sample saving on top of run_eval_batch
 
 FALLBACK_MIN_ELO = 1320
 FALLBACK_MAX_ELO = 3190
@@ -924,13 +925,16 @@ def main():
 
             log.info(f"=== Generation {generation}: eval, {args.eval_games} games "
                      f"(model MCTS vs Stockfish@{current_elo}) ===")
-            result = run_eval_batch(mcts_proc, sf_adaptive, model, device, args.sims, args.threads,
+            pgn_sample_path = f"eval_sample_gen{generation}.pgn"
+            result = run_eval_batch_with_pgn(mcts_proc, sf_adaptive, model, device, args.sims, args.threads,
                                      args.max_moves, args.eval_games, adaptive_limit,
                                      elo=current_elo, desc=f"Gen {generation} eval",
                                      sf_teacher=sf_teacher if args.corrective_analysis else None,
                                      corrective_limit=corrective_limit,
                                      corrective_cp_threshold=args.corrective_cp_threshold,
-                                     corrective_eval_blend=args.corrective_eval_blend)
+                                     corrective_eval_blend=args.corrective_eval_blend,
+                                     pgn_sample_path=pgn_sample_path, pgn_sample_size=5)
+            log.info(f"Saved sample games (win/loss/draw mix) to '{pgn_sample_path}'.")
             log.info(f"Eval @ Elo {current_elo}: {result['wins']}-{result['losses']}-{result['draws']} "
                      f"(score {result['score']:.1%})")
 
