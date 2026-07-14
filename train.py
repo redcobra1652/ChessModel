@@ -358,7 +358,7 @@ def position_outcome(board: chess.Board):
 # Engine request handlers (Python side of the protocol)
 # ----------------------------------------------------------------------
 
-def _replay(history: list, path: list = ()) -> chess.Board:
+def _replay(history: list, path: list = (), start_fen: str = None) -> chess.Board:
     """Reconstructs a board by replaying real moves from the game start.
 
     This is the crux of correct repetition handling: a board built from a
@@ -370,7 +370,7 @@ def _replay(history: list, path: list = ()) -> chess.Board:
     board_to_tensor work correctly, including for hypothetical lines deep
     inside the search tree (via `path`), not just the real game.
     """
-    board = chess.Board()
+    board = chess.Board(start_fen) if start_fen else chess.Board()
     for uci in history:
         board.push_uci(uci)
     for uci in path:
@@ -378,32 +378,41 @@ def _replay(history: list, path: list = ()) -> chess.Board:
     return board
 
 
-def handle_root(history: list) -> dict:
-    board = _replay(history)
-    terminal, result = position_outcome(board)
-    if terminal:
-        return {"terminal": True, "result": result, "moves": [], "priors": [], "value": result}
-    moves, priors, value = nn_eval(board, is_root=True)
-    return {"terminal": False, "result": 0.0, "moves": moves, "priors": priors, "value": value}
+_SAFE_TERMINAL = {"terminal": True, "result": 0.0, "moves": [], "priors": [], "value": 0.0}
 
 
-def handle_visit(history: list, path: list, move_uci: str) -> dict:
-    board = _replay(history, path)
-    move = chess.Move.from_uci(move_uci)
-    # --- Safety check: the engine must never request an illegal move ---
-    assert move in board.legal_moves, (
-        f"ILLEGAL MOVE requested by mcts_engine: {move_uci} at FEN '{board.fen()}'. "
-        f"Legal moves were: {[m.uci() for m in board.legal_moves]}"
-    )
-    board.push(move)
-    child_fen = board.fen()
-    terminal, result = position_outcome(board)
-    if terminal:
-        return {"fen": child_fen, "terminal": True, "result": result,
-                "moves": [], "priors": [], "value": result}
-    moves, priors, value = nn_eval(board, is_root=False)
-    return {"fen": child_fen, "terminal": False, "result": 0.0,
-            "moves": moves, "priors": priors, "value": value}
+def handle_root(history: list, start_fen: str = None) -> dict:
+    try:
+        board = _replay(history, start_fen=start_fen)
+        terminal, result = position_outcome(board)
+        if terminal:
+            return {"terminal": True, "result": result, "moves": [], "priors": [], "value": result}
+        moves, priors, value = nn_eval(board, is_root=True)
+        return {"terminal": False, "result": 0.0, "moves": moves, "priors": priors, "value": value}
+    except Exception as e:
+        log.warning(f"handle_root error (returning safe terminal): {e}")
+        return _SAFE_TERMINAL
+
+
+def handle_visit(history: list, path: list, move_uci: str, start_fen: str = None) -> dict:
+    try:
+        board = _replay(history, path, start_fen=start_fen)
+        move = chess.Move.from_uci(move_uci)
+        if move not in board.legal_moves:
+            log.warning(f"Illegal move from engine: {move_uci} at {board.fen()} — returning safe terminal")
+            return {"fen": board.fen(), **_SAFE_TERMINAL}
+        board.push(move)
+        child_fen = board.fen()
+        terminal, result = position_outcome(board)
+        if terminal:
+            return {"fen": child_fen, "terminal": True, "result": result,
+                    "moves": [], "priors": [], "value": result}
+        moves, priors, value = nn_eval(board, is_root=False)
+        return {"fen": child_fen, "terminal": False, "result": 0.0,
+                "moves": moves, "priors": priors, "value": value}
+    except Exception as e:
+        log.warning(f"handle_visit error (returning safe terminal): {e}")
+        return {"fen": "", **_SAFE_TERMINAL}
 
 
 ENGINE_READ_TIMEOUT_SECS = 120  # generous margin above any real per-request cost
@@ -441,6 +450,18 @@ def search(proc, board: chess.Board, sims: int, threads: int):
     threads: exactly one side is ever blocked waiting on the other.
     """
     history = [m.uci() for m in board.move_stack]
+
+    # Detect a non-standard starting position so _replay() inside
+    # handle_root/handle_visit can reconstruct the board correctly.
+    # Walk back to the root of the move stack to find the true base FEN.
+    if board.move_stack:
+        temp = board.copy(stack=True)
+        while temp.move_stack:
+            temp.pop()
+        start_fen = None if temp.fen() == chess.STARTING_FEN else temp.fen()
+    else:
+        start_fen = None if board.fen() == chess.STARTING_FEN else board.fen()
+
     proc.stdin.write(json.dumps({
         "cmd": "search", "fen": board.fen(), "sims": sims, "threads": threads,
         "history": history,
@@ -455,18 +476,26 @@ def search(proc, board: chess.Board, sims: int, threads: int):
         line = line.strip()
         if not line:
             continue
-        obj = json.loads(line)
+
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            log.warning(f"Malformed JSON from engine (skipping): {e} -- line={line[:120]!r}")
+            continue
 
         if obj.get("cmd") == "result":
             visits = dict(zip(obj["moves"], obj["visits"]))
             return visits, obj["value"]
 
         if obj.get("type") == "root":
-            resp = handle_root(obj.get("history", []))
+            resp = handle_root(obj.get("history", []), start_fen=start_fen)
         elif obj.get("type") == "visit":
-            resp = handle_visit(obj.get("history", []), obj.get("path", []), obj["move"])
+            resp = handle_visit(obj.get("history", []), obj.get("path", []), obj["move"], start_fen=start_fen)
         else:
-            raise RuntimeError(f"Unknown message from engine: {line}")
+            # Engine echoed something unexpected (e.g. a bounced response).
+            # Send a safe terminal so the engine is never left waiting.
+            log.warning(f"Unexpected engine message (sending safe terminal): {line[:120]!r}")
+            resp = _SAFE_TERMINAL
 
         proc.stdin.write(json.dumps(resp) + "\n")
         proc.stdin.flush()

@@ -1011,7 +1011,7 @@ def draw_home_screen(screen, font, big_font, title_font, buttons, hovered,
 # Model-thinking background worker
 # ----------------------------------------------------------------------
 
-def model_move_worker(proc, board_snapshot, sims, threads, result_queue):
+def model_move_worker(proc, board_snapshot, sims, threads, result_queue, epoch):
     """Runs entirely off the main/GUI thread. Only reads `board_snapshot`
     (a chess.Board the GUI thread will not mutate again until the move
     lands), so there is no concurrent-write race with the render loop,
@@ -1032,10 +1032,16 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue):
     about there having been a real search.
     """
     try:
+        # Don't search a position that's already over — handle_root would
+        # return terminal with moves=[], causing "cannot choose from empty
+        # sequence" in pick_move_from_visits.
+        if board_snapshot.is_game_over(claim_draw=True):
+            result_queue.put(("error", "game is already over", epoch))
+            return
         mate_move = train.find_immediate_mate(board_snapshot)
         if mate_move is not None:
             best_uci = mate_move.uci()
-            result_queue.put(("ok", {"uci": best_uci, "visits": {best_uci: 1}, "value": 1.0}))
+            result_queue.put(("ok", {"uci": best_uci, "visits": {best_uci: 1}, "value": 1.0}, epoch))
             return
         visits, value = train.search(proc, board_snapshot, sims=sims, threads=threads)
         # pick_safe_move_from_visits screens out any top pick that would
@@ -1044,9 +1050,9 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue):
         # only ever covers the engine's OWN mating chances, never
         # whether its choice lets the opponent mate back next move.
         best_uci = train.pick_safe_move_from_visits(board_snapshot, visits, temperature=0.0)
-        result_queue.put(("ok", {"uci": best_uci, "visits": visits, "value": value}))
+        result_queue.put(("ok", {"uci": best_uci, "visits": visits, "value": value}, epoch))
     except Exception as e:  # surface engine crashes to the GUI instead of hanging it
-        result_queue.put(("error", str(e)))
+        result_queue.put(("error", str(e), epoch))
 
 
 # ----------------------------------------------------------------------
@@ -1118,6 +1124,7 @@ class Game:
         self.thinking = False
         self.result_queue = queue.Queue()
         self.worker_thread = None
+        self.search_epoch = 0
 
         self.pgn_copied_at = None  # timestamp (ms) of the last "Copy PGN" click
 
@@ -1145,6 +1152,16 @@ class Game:
         self.premoves = []
         self.premove_selected_square = None
         self.pgn_copied_at = None
+        # If a model-move search from the game we're replacing is still
+        # running, it's using self.proc's pipe right now. Bump the epoch
+        # so poll_model_move (if ever reached again) ignores its result,
+        # and join it here before dropping the reference -- otherwise it
+        # keeps running in the background and can collide with the next
+        # search this reset kicks off below, corrupting the shared
+        # engine pipe (see kick_off_model_move for the full explanation).
+        self.search_epoch = getattr(self, "search_epoch", 0) + 1
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.worker_thread.join()
         self.thinking = False
         self.worker_thread = None
         self.move_analysis = []
@@ -1292,11 +1309,32 @@ class Game:
         self.moves_scroll = max(0, min(self.moves_scroll + direction, self.moves_max_scroll))
 
     def kick_off_model_move(self):
+        # A previous worker thread (from a game that just got reset, e.g.
+        # via a custom-position setup or "New Game" while the model was
+        # still thinking) may still be mid-flight on self.proc's pipe.
+        # Starting a second train.search() call on the same subprocess
+        # concurrently interleaves two requesters' JSON lines on one
+        # stdin/stdout pipe -- the engine's main() loop ends up reading a
+        # line meant for the other call's send_request() as a top-level
+        # command ("unknown command: ..."), and replies for the wrong
+        # search get matched to the wrong board, producing bogus illegal
+        # moves. Block briefly until the pipe is free again before
+        # issuing a new search -- this should be near-instant in the
+        # normal case (no stale worker) and only actually waits when a
+        # reset raced a still-running search.
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.worker_thread.join()
+            while not self.result_queue.empty():
+                self.result_queue.get_nowait()
+
+        self.search_epoch = getattr(self, "search_epoch", 0) + 1
+        my_epoch = self.search_epoch
         self.thinking = True
         board_snapshot = self.board.copy(stack=True)
         self.worker_thread = threading.Thread(
             target=model_move_worker,
-            args=(self.proc, board_snapshot, self.args.sims, self.args.threads, self.result_queue),
+            args=(self.proc, board_snapshot, self.args.sims, self.args.threads,
+                  self.result_queue, my_epoch),
             daemon=True,
         )
         self.worker_thread.start()
@@ -1305,12 +1343,27 @@ class Game:
         if not self.thinking:
             return
         try:
-            status, payload = self.result_queue.get_nowait()
+            status, payload, epoch = self.result_queue.get_nowait()
         except queue.Empty:
+            return
+        # Discard results from a search that's since been superseded by a
+        # reset/new game (see kick_off_model_move) -- applying a stale
+        # move onto whatever board exists now would be nonsense at best
+        # and, before the join() added there, could previously race a
+        # newer in-flight search on the same engine pipe.
+        if epoch != getattr(self, "search_epoch", None):
             return
         self.thinking = False
         if status == "error":
-            self.result_text = f"Engine error: {payload}"
+            # Suppress the generic "game is already over" sentinel — it
+            # just means the game ended while the worker was spinning up.
+            if payload != "game is already over" and not self.result_text:
+                self.result_text = f"Engine error: {payload}"
+            return
+        # Game may have ended (resign, checkmate by human, etc.) while the
+        # model was thinking — discard the result rather than applying a
+        # move onto a finished position.
+        if self.result_text:
             return
         move = chess.Move.from_uci(payload["uci"])
         # Root value is from the mover's own perspective (see
