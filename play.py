@@ -893,12 +893,22 @@ def generate_endgame_position(stockfish_dir="stockfish",
     Let two Stockfish@1320 bots play each other from the opening until
     the total piece count (excluding kings) drops to target_pieces or
     fewer, then return that board position as a FEN string.
+
+    Raises RuntimeError on any failure (missing binary, engine crash,
+    etc.) rather than returning None -- returning None here used to be
+    silently treated as "just start a normal game" by the caller, which
+    meant a failed generation looked identical to a successful one from
+    the player's point of view: the loading spinner ran to completion
+    either way, and the game quietly started from the opening position
+    with no indication anything had gone wrong. Callers that want a
+    graceful fallback should catch this explicitly.
     """
     sf_path = find_stockfish_binary_play(stockfish_dir)
     if sf_path is None:
-        print(f"Warning: no Stockfish binary found under '{stockfish_dir}'. "
-              f"Starting from the opening position instead.")
-        return None
+        raise RuntimeError(
+            f"No Stockfish binary found under '{stockfish_dir}'. "
+            f"Endgame generation requires Stockfish -- check --stockfish-dir."
+        )
 
     limit = chess.engine.Limit(time=movetime_ms / 1000.0)
 
@@ -908,8 +918,7 @@ def generate_endgame_position(stockfish_dir="stockfish",
         for sf in (sf1, sf2):
             sf.configure({"UCI_LimitStrength": True, "UCI_Elo": 1320})
     except Exception as e:
-        print(f"Warning: could not start Stockfish for endgame generation: {e}")
-        return None
+        raise RuntimeError(f"Could not start Stockfish for endgame generation: {e}") from e
 
     board = chess.Board()
     result_fen = None
@@ -930,14 +939,24 @@ def generate_endgame_position(stockfish_dir="stockfish",
             try:
                 res = sf.play(board, limit)
                 board.push(res.move)
-            except Exception:
-                break
+            except Exception as e:
+                raise RuntimeError(f"Stockfish crashed during endgame generation: {e}") from e
     finally:
         sf1.quit()
         sf2.quit()
 
-    if result_fen is None and not board.is_game_over(claim_draw=True):
-        result_fen = board.fen()
+    if result_fen is None:
+        if board.is_game_over(claim_draw=True):
+            # The bots' game ended (checkmate/stalemate/etc.) before ever
+            # reaching target_pieces -- fall back to the final position
+            # reached rather than failing outright, since this is a
+            # legitimate (if unlucky) outcome, not an error.
+            result_fen = board.fen()
+        else:
+            raise RuntimeError(
+                f"Endgame generation ran {max_moves} moves without reaching "
+                f"{target_pieces} pieces or a game end -- giving up."
+            )
 
     return result_fen
 
@@ -959,14 +978,21 @@ _HOME_BTN_H   = 58
 _HOME_BTN_GAP = 18
 
 
+_HOME_ERROR_COLOR = (220, 90, 90)
+
+
 def draw_home_screen(screen, font, big_font, title_font, buttons, hovered,
-                     loading=False, loading_text="Generating endgame..."):
+                     loading=False, loading_text="Generating endgame...",
+                     error_text=None):
     """
     Draw the home screen with the given buttons list.
     Each button is a dict: {"label": str, "sublabel": str, "rect": pygame.Rect,
                              "accent": bool}
     hovered: index of the currently-hovered button, or None.
     loading: if True, show a spinner/loading message instead of buttons.
+    error_text: if set, shown as a banner beneath the subtitle (e.g. a
+        failed endgame generation) so a failure is never silently
+        indistinguishable from a normal successful start.
     """
     screen.fill(_HOME_BG)
 
@@ -977,6 +1003,24 @@ def draw_home_screen(screen, font, big_font, title_font, buttons, hovered,
 
     sub_surf = font.render("Choose how to start", True, _HOME_SUBTITLE)
     screen.blit(sub_surf, (cx - sub_surf.get_width() // 2, 170))
+
+    if error_text:
+        # Wrap long messages (e.g. an exception string) across a couple
+        # of lines rather than letting them run off the window.
+        words = error_text.split()
+        lines, cur = [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if font.size(trial)[0] > WINDOW_W - 80 and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = trial
+        if cur:
+            lines.append(cur)
+        for i, ln in enumerate(lines[:3]):
+            err_surf = font.render(ln, True, _HOME_ERROR_COLOR)
+            screen.blit(err_surf, (cx - err_surf.get_width() // 2, 195 + i * 20))
 
     if loading:
         dots = "." * ((pygame.time.get_ticks() // 400) % 4)
@@ -1061,7 +1105,7 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue, epoch):
 
 class Game:
     def __init__(self, args, screen, font, big_font, eval_font, images, sounds,
-                 board_backgrounds, proc):
+                 board_backgrounds, proc, start_fen=None):
         self.args = args
         self.screen = screen
         self.font = font
@@ -2064,6 +2108,8 @@ def main():
             endgame_fen = None
             gen_thread  = None
             gen_result  = [None]
+            gen_error   = [None]
+            home_error  = None  # message banner shown on the home screen
 
             # ── Home screen ──────────────────────────────────────────
             in_home = True
@@ -2090,15 +2136,19 @@ def main():
                                     chosen_mode = btn["mode"]
                                     if chosen_mode in ("endgame_white", "endgame_black"):
                                         loading = True
-                                        def _gen(result_box, sf_dir, n_pieces):
-                                            result_box[0] = generate_endgame_position(
-                                                stockfish_dir=sf_dir,
-                                                target_pieces=n_pieces,
-                                                movetime_ms=50,
-                                            )
+                                        home_error = None
+                                        def _gen(result_box, error_box, sf_dir, n_pieces):
+                                            try:
+                                                result_box[0] = generate_endgame_position(
+                                                    stockfish_dir=sf_dir,
+                                                    target_pieces=n_pieces,
+                                                    movetime_ms=50,
+                                                )
+                                            except Exception as e:
+                                                error_box[0] = str(e)
                                         gen_thread = threading.Thread(
                                             target=_gen,
-                                            args=(gen_result, args.stockfish_dir,
+                                            args=(gen_result, gen_error, args.stockfish_dir,
                                                   args.endgame_pieces),
                                             daemon=True,
                                         )
@@ -2108,12 +2158,21 @@ def main():
                                     break
 
                 if loading and gen_thread is not None and not gen_thread.is_alive():
-                    endgame_fen = gen_result[0]
-                    loading     = False
-                    in_home     = False
+                    loading = False
+                    if gen_error[0] is not None:
+                        # Generation failed -- stay on the home screen and
+                        # show why, instead of silently falling through to
+                        # a normal game (which used to look identical to a
+                        # successful endgame setup from the player's side).
+                        home_error = f"Endgame generation failed: {gen_error[0]}"
+                        chosen_mode = None
+                    else:
+                        endgame_fen = gen_result[0]
+                        in_home     = False
 
                 draw_home_screen(screen, font, big_font, title_font,
-                                 home_buttons, hovered, loading=loading)
+                                 home_buttons, hovered, loading=loading,
+                                 error_text=home_error)
                 pygame.display.flip()
                 clock.tick(60)
 
