@@ -44,7 +44,11 @@ from tqdm import tqdm
 ENGINE_SRC = "mcts.cpp"
 ENGINE_BIN = "./mcts_engine"
 BEST_MODEL_PATH = "best_model.pt"
-ACTION_SIZE = 64 * 64  # from_square * 64 + to_square (promotion piece collapsed; see notes)
+ACTION_SIZE = 64 * 64 + 48  # from_square * 64 + to_square for non-promotions (4096 indices),
+                             # plus 48 dedicated promotion indices (see move_policy_index).
+                             # Promotions: 8 files x 2 colors x 3 non-queen pieces = 48.
+                             # Queen promotion uses the base from*64+to slot (index < 4096)
+                             # so the model's default "just push the pawn" action is queen.
 
 # Set by main() before every real move: which network answers this
 # engine's NN-evaluation requests for the *entire* search tree of that
@@ -208,19 +212,43 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
 
 
 def move_policy_index(move: chess.Move, mirror: bool = False) -> int:
-    """Collapses a move to an index in [0, 4096). Underpromotion variants
-    to the same destination square collide onto the same index -- a
-    deliberate simplification for a *minimal* engine (see README notes
-    in the accompanying instructions). This never affects legality:
-    actual play always uses full python-chess Move/uci objects.
+    """Maps a move to a unique index in [0, ACTION_SIZE).
 
-    `mirror` must match whatever board_to_tensor() used for the position
-    this move belongs to (i.e. True whenever it was Black to move), so the
-    policy index lines up with the same mirrored square numbering the
-    board tensor was built with."""
+    Non-promotion moves (the vast majority): index = from_sq * 64 + to_sq,
+    occupying [0, 4096) exactly as before. This is unchanged so all existing
+    replay-buffer examples remain valid.
+
+    Promotion moves: queen promotions also use the base from*64+to slot so
+    that the model's natural "push pawn to back rank" action defaults to the
+    correct piece. Underpromotions (rook / bishop / knight) get a dedicated
+    index in [4096, 4144):
+
+        4096 + file * 6 + color_offset * 3 + piece_offset
+
+    where:
+        file         = 0-7  (a-h file of the destination square)
+        color_offset = 0 if promoting as White (to rank 8, mirror=False)
+                       1 if promoting as Black (to rank 1, mirror=True)
+        piece_offset = 0 for rook, 1 for bishop, 2 for knight
+
+    This gives 8 * 2 * 3 = 48 unique underpromotion slots, for a total of
+    4096 + 48 = 4144 = ACTION_SIZE.
+
+    `mirror` must match board_to_tensor() for this position (True when Black
+    is to move), ensuring the square numbering is consistent throughout.
+    """
     frm = chess.square_mirror(move.from_square) if mirror else move.from_square
-    to = chess.square_mirror(move.to_square) if mirror else move.to_square
-    return frm * 64 + to
+    to  = chess.square_mirror(move.to_square)   if mirror else move.to_square
+
+    if move.promotion is None or move.promotion == chess.QUEEN:
+        # Non-promotion and queen promotion share the base slot.
+        return frm * 64 + to
+
+    # Underpromotion: encode into the dedicated [4096, 4144) block.
+    file = chess.square_file(to)
+    color_offset = 1 if mirror else 0  # mirror=True means Black is promoting
+    piece_offset = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}[move.promotion]
+    return 4096 + file * 6 + color_offset * 3 + piece_offset
 
 
 # ----------------------------------------------------------------------

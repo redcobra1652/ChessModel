@@ -646,6 +646,36 @@ def run_eval_batch(mcts_proc, sf_engine, model, device, sims, threads, max_moves
             "corrective_examples": all_corrective}
 
 
+def _save_checkpoint(path: str, model, optimizer, current_lr: float,
+                     global_gen: int, num_promotions: int):
+    """Save full training state: model weights, optimizer state (Adam momentum
+    buffers), current LR, global generation count, and promotion count."""
+    torch.save({
+        "model":          model.state_dict(),
+        "optimizer":      optimizer.state_dict(),
+        "lr":             current_lr,
+        "global_gen":     global_gen,
+        "num_promotions": num_promotions,
+    }, path)
+
+
+def run_promotion_probe(mcts_proc, sf_probe, model, device, sims, threads, max_moves,
+                        n_games, sf_limit_fn, probe_elo: int,
+                        threshold: float, desc: str) -> float:
+    """Run a short eval batch against `probe_elo` Stockfish.
+
+    `sf_limit_fn` is a callable(elo) -> chess.engine.Limit (so the caller
+    can reuse the same engine with a fresh configure() call each time).
+    Returns the model's score (wins + 0.5*draws) / total.
+    """
+    sf_probe.configure({"UCI_LimitStrength": True, "UCI_Elo": probe_elo})
+    result = run_eval_batch(mcts_proc, sf_probe, model, device, sims, threads,
+                            max_moves, n_games, sf_limit_fn(probe_elo), elo=probe_elo,
+                            desc=desc)
+    result.pop("corrective_examples", None)
+    return result["score"]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train a DualHeadResNet to imitate Stockfish, with Stockfish's own "
@@ -713,7 +743,27 @@ def main():
                          help="Ceiling on train steps per generation when using "
                               "--steps-per-buffer-example, to bound wall-clock time.")
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-3,
+                         help="Initial learning rate. Ignored on restart if a new-format checkpoint "
+                              "is present (restored LR takes precedence). (default: 1e-3)")
+    parser.add_argument("--lr-decay", type=float, default=0.97,
+                         help="Per-generation exponential LR decay factor applied every generation "
+                              "before training: lr = max(lr_floor, initial_lr * decay**global_gen). "
+                              "0.97-0.98 for slow decay, 1.0 to disable. (default: 0.97)")
+    parser.add_argument("--lr-floor", type=float, default=1e-5,
+                         help="Hard lower bound on LR. Neither exponential decay nor promotion "
+                              "multipliers can push LR below this value. (default: 1e-5)")
+    parser.add_argument("--promotion-lr-multiplier", type=float, default=0.6,
+                         help="LR is multiplied by this factor on each promotion event. "
+                              "Compounds across promotions (3 promotions = 0.6^3 = 0.216x). "
+                              "(default: 0.6)")
+    parser.add_argument("--probe-games", type=int, default=10,
+                         help="Number of eval games to play against each successive probe Elo "
+                              "after a promotion (probe starts at promoted_elo + elo_step). "
+                              "(default: 10)")
+    parser.add_argument("--probe-threshold", type=float, default=None,
+                         help="Win-rate threshold to clear a probe level and advance to the next. "
+                              "Defaults to --promotion-threshold if not set.")
     parser.add_argument("--buffer-size", type=int, default=50000)
     parser.add_argument("--trajectory-log", type=str, default=TRAJECTORY_LOG_DEFAULT)
     parser.add_argument("--buffer-path", type=str, default="replay_buffer.pkl",
@@ -765,15 +815,69 @@ def main():
     train.setup_logging()
     device = torch.device(args.device)
     model = train.DualHeadResNet().to(device)
+
+    # --- Checkpoint load: supports both old format (raw state_dict) and new
+    # format (dict with model/optimizer/lr/global_gen/num_promotions). ---
+    restored_lr = None
+    global_gen = 0
+    num_promotions = 0
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
     try:
-        model.load_state_dict(torch.load(args.model, map_location=device))
-        log.info(f"Loaded starting weights from '{args.model}'.")
+        raw = torch.load(args.model, map_location=device)
+        if isinstance(raw, dict) and "model" in raw:
+            # New-format checkpoint
+            model.load_state_dict(raw["model"])
+            opt_state = raw.get("optimizer")
+            if opt_state is not None:
+                optimizer.load_state_dict(opt_state)
+                # Move optimizer state tensors to the right device
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+                log.info("Restored optimizer state from checkpoint.")
+            else:
+                log.warning(
+                    "Checkpoint has no optimizer state (was cleared during migration). "
+                    "Adam momentum buffers will reinitialize from scratch -- expect a "
+                    "brief update spike for the first 1-2 generations."
+                )
+            restored_lr    = raw.get("lr", args.lr)
+            global_gen     = raw.get("global_gen", 0)
+            num_promotions = raw.get("num_promotions", 0)
+            if args.lr != 1e-3:  # user explicitly passed --lr
+                log.warning(
+                    f"Checkpoint found: ignoring --lr {args.lr:.2e} and restoring "
+                    f"saved lr={restored_lr:.2e}. Remove the checkpoint to start fresh."
+                )
+            log.info(
+                f"Loaded checkpoint from '{args.model}': "
+                f"global_gen={global_gen}, num_promotions={num_promotions}, lr={restored_lr:.2e}."
+            )
+        else:
+            # Old-format checkpoint: raw state_dict only
+            model.load_state_dict(raw)
+            log.info(
+                f"Loaded legacy weights-only checkpoint from '{args.model}'. "
+                f"Optimizer state and global_gen not available; starting fresh for those."
+            )
     except FileNotFoundError:
-        torch.save(model.state_dict(), args.model)
-        log.info(f"No existing '{args.model}' found; initialized and saved a fresh model.")
+        torch.save({"model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr": args.lr,
+                    "global_gen": 0,
+                    "num_promotions": 0}, args.model)
+        log.info(f"No existing '{args.model}' found; initialized and saved a fresh checkpoint.")
+
     model.eval()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # current_lr: use restored value if checkpoint had one, else args.lr
+    current_lr = restored_lr if restored_lr is not None else args.lr
+    # Apply it to the optimizer param groups (in case we loaded old-format
+    # and the optimizer was freshly constructed).
+    for pg in optimizer.param_groups:
+        pg["lr"] = current_lr
     buffer = train.ReplayBuffer(args.buffer_size)
 
     if args.buffer_path and os.path.exists(args.buffer_path):
@@ -863,8 +967,29 @@ def main():
         stalled_batches = 0
         batch_games = args.batch_games
         corrective_buffer = []  # separate from ReplayBuffer; holds 5-tuples for corrective_train_step
+        probe_threshold = args.probe_threshold if args.probe_threshold is not None else args.promotion_threshold
+
+        # A fifth Stockfish instance used exclusively for promotion probes so
+        # we can reconfigure its Elo freely without touching the data-gen engines.
+        sf_probe = start_stockfish(sf_path, args.stockfish_threads, args.stockfish_hash)
+        sf_probe.configure({"UCI_LimitStrength": True, "UCI_Elo": current_elo})
+
         while True:
             generation += 1
+            global_gen += 1  # persists across restarts via checkpoint
+
+            # --- Exponential LR decay ---
+            # Recompute from initial_lr and global_gen on every generation so
+            # the schedule is deterministic and restart-stable. The promotion
+            # multiplier is already baked into current_lr (it's saved/loaded),
+            # so we apply decay on top of *current_lr* rather than args.lr to
+            # avoid overwriting the compounded multipliers.
+            decayed_lr = current_lr * (args.lr_decay ** 1)  # one step per generation
+            current_lr = max(args.lr_floor, decayed_lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
+            log.info(f"Generation {generation} (global {global_gen}): lr={current_lr:.2e}")
+
             # Both adaptive instances are always kept in lockstep at the
             # same Elo target -- they're playing EACH OTHER, not one
             # imitating a teacher, so any Elo mismatch between them would
@@ -944,8 +1069,9 @@ def main():
                 model.eval()
 
             if generation % args.save_every_gens == 0:
-                torch.save(model.state_dict(), args.output)
-                log.info(f"Saved checkpoint to '{args.output}'.")
+                _save_checkpoint(args.output, model, optimizer, current_lr, global_gen, num_promotions)
+                log.info(f"Saved checkpoint to '{args.output}' "
+                         f"(global_gen={global_gen}, num_promotions={num_promotions}, lr={current_lr:.2e}).")
                 if args.buffer_path:
                     try:
                         with open(args.buffer_path, "wb") as f:
@@ -992,8 +1118,69 @@ def main():
                 if current_elo >= max_elo:
                     log.info(f"Cleared promotion threshold at max Elo ({max_elo}) -- curriculum complete.")
                     break
-                current_elo = clamp(current_elo + args.elo_step, min_elo, max_elo)
-                log.info(f"PROMOTED: Stockfish Elo target -> {current_elo}.")
+
+                # --- Promotion + cascading probe ---
+                # Each time the model clears a level, we run a short eval
+                # against (new_elo + elo_step) -- one step ahead of the just-
+                # promoted level. If it clears that too, we keep probing upward
+                # until it fails or hits the ceiling. Every promotion event
+                # (including each skipped level) applies the LR multiplier once.
+                probe_elo = current_elo + args.elo_step  # first probe target
+                levels_skipped = 0
+
+                while True:
+                    # Commit the promotion to the next level
+                    current_elo = clamp(probe_elo, min_elo, max_elo)
+                    num_promotions += 1
+                    lr_before = current_lr
+                    current_lr = max(args.lr_floor, current_lr * args.promotion_lr_multiplier)
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = current_lr
+                    log.info(
+                        f"PROMOTED: Stockfish Elo target -> {current_elo}  "
+                        f"(promotion #{num_promotions}, lr {lr_before:.2e} -> {current_lr:.2e} "
+                        f"[x{args.promotion_lr_multiplier}])."
+                        + (f"  [{levels_skipped} level(s) skipped so far]" if levels_skipped else "")
+                    )
+
+                    if current_elo >= max_elo:
+                        log.info(f"Reached max Elo ({max_elo}) during promotion probe chain -- stopping.")
+                        break
+
+                    # Probe one level above where we just landed
+                    next_probe_elo = clamp(current_elo + args.elo_step, min_elo, max_elo)
+                    if next_probe_elo <= current_elo:
+                        break  # already at ceiling
+
+                    probe_score = run_promotion_probe(
+                        mcts_proc, sf_probe, model, device,
+                        args.sims, args.threads, args.max_moves,
+                        args.probe_games,
+                        sf_limit_fn=lambda elo: make_limit(args.stockfish_movetime_ms, args.stockfish_depth),
+                        probe_elo=next_probe_elo,
+                        threshold=probe_threshold,
+                        desc=f"Probe vs {next_probe_elo}",
+                    )
+                    log.info(
+                        f"Probe vs {next_probe_elo}: score={probe_score:.1%} "
+                        f"(threshold {probe_threshold:.0%}) -> "
+                        + ("SKIP LEVEL -- probing higher." if probe_score >= probe_threshold
+                           else f"stay at {current_elo}.")
+                    )
+                    log_trajectory(trajectory_fh, {
+                        "phase": "probe", "generation": generation,
+                        "probe_elo": next_probe_elo, "score": probe_score,
+                        "passed": probe_score >= probe_threshold,
+                        "current_elo_after": current_elo,
+                        "lr_after": current_lr,
+                    })
+
+                    if probe_score < probe_threshold:
+                        break  # stay at current_elo; stop cascading
+
+                    # Passed probe -- cascade upward
+                    probe_elo = next_probe_elo
+                    levels_skipped += 1
             else:
                 stalled_batches += 1
                 batch_games = min(batch_games + args.batch_games_growth, args.max_batch_games)
@@ -1008,13 +1195,18 @@ def main():
                 log.info(f"Reached --max-generations budget ({args.max_generations}); stopping.")
                 break
 
-        torch.save(model.state_dict(), args.output)
-        log.info(f"Done. Final Elo target: {current_elo}. Saved final weights to '{args.output}'.")
+        _save_checkpoint(args.output, model, optimizer, current_lr, global_gen, num_promotions)
+        log.info(f"Done. Final Elo target: {current_elo}. Saved final weights to '{args.output}' "
+                 f"(global_gen={global_gen}, num_promotions={num_promotions}, lr={current_lr:.2e}).")
 
     finally:
         sf_teacher.quit()
         sf_adaptive.quit()
         sf_adaptive_b.quit()
+        try:
+            sf_probe.quit()
+        except Exception:
+            pass  # sf_probe may not exist if startup failed before it was created
         train.shutdown_engine(mcts_proc)
         if trajectory_fh:
             trajectory_fh.close()

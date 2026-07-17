@@ -65,7 +65,16 @@ def main():
 
     device = torch.device(args.device)
     model = train.DualHeadResNet().to(device)
-    model.load_state_dict(torch.load(args.model, map_location=device))
+
+    checkpoint = torch.load(args.model, map_location=device)
+    # Support both raw state-dicts (torch.save(model.state_dict(), ...)) and
+    # wrapped checkpoints (torch.save({"model": ..., "optimizer": ..., ...}, ...))
+    # as produced by stockfish_train.py and similar scripts.
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    model.load_state_dict(state_dict)
     model.eval()
 
     print("=" * 100)
