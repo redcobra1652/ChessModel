@@ -2022,7 +2022,10 @@ def main():
 
     model = train.DualHeadResNet().to(device)
     try:
-        model.load_state_dict(torch.load(args.model, map_location=device))
+        checkpoint = torch.load(args.model, map_location=device)
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            checkpoint = checkpoint["model"]
+        model.load_state_dict(checkpoint)
     except FileNotFoundError:
         print(f"Could not find model weights at '{args.model}'.")
         print("Train one first with train.py, or point --model at an existing checkpoint.")

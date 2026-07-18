@@ -41,7 +41,9 @@ def main():
     device = torch.device(args.device)
 
     model = train.DualHeadResNet().to(device)
-    model.load_state_dict(torch.load(args.model, map_location=device))
+    checkpoint = torch.load(args.model, map_location=device)
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded weights from {args.model}")
 

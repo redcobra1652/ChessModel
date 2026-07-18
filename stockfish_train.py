@@ -743,9 +743,10 @@ def main():
                          help="Ceiling on train steps per generation when using "
                               "--steps-per-buffer-example, to bound wall-clock time.")
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3,
-                         help="Initial learning rate. Ignored on restart if a new-format checkpoint "
-                              "is present (restored LR takes precedence). (default: 1e-3)")
+    parser.add_argument("--lr", type=float, default=None,
+                         help="Learning rate. When resuming from a checkpoint, the saved LR is "
+                              "used by default; pass --lr to override it explicitly. "
+                              "When starting fresh (no checkpoint), defaults to 1e-3.")
     parser.add_argument("--lr-decay", type=float, default=0.97,
                          help="Per-generation exponential LR decay factor applied every generation "
                               "before training: lr = max(lr_floor, initial_lr * decay**global_gen). "
@@ -821,7 +822,7 @@ def main():
     restored_lr = None
     global_gen = 0
     num_promotions = 0
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr or 1e-3, weight_decay=1e-4)
 
     try:
         raw = torch.load(args.model, map_location=device)
@@ -843,14 +844,14 @@ def main():
                     "Adam momentum buffers will reinitialize from scratch -- expect a "
                     "brief update spike for the first 1-2 generations."
                 )
-            restored_lr    = raw.get("lr", args.lr)
+            restored_lr    = raw.get("lr", 1e-3)
             global_gen     = raw.get("global_gen", 0)
             num_promotions = raw.get("num_promotions", 0)
-            if args.lr != 1e-3:  # user explicitly passed --lr
-                log.warning(
-                    f"Checkpoint found: ignoring --lr {args.lr:.2e} and restoring "
-                    f"saved lr={restored_lr:.2e}. Remove the checkpoint to start fresh."
+            if args.lr is not None:
+                log.info(
+                    f"--lr {args.lr:.2e} overrides checkpoint LR {restored_lr:.2e}."
                 )
+                restored_lr = args.lr
             log.info(
                 f"Loaded checkpoint from '{args.model}': "
                 f"global_gen={global_gen}, num_promotions={num_promotions}, lr={restored_lr:.2e}."
@@ -865,15 +866,16 @@ def main():
     except FileNotFoundError:
         torch.save({"model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "lr": args.lr,
+                    "lr": args.lr or 1e-3,
                     "global_gen": 0,
                     "num_promotions": 0}, args.model)
         log.info(f"No existing '{args.model}' found; initialized and saved a fresh checkpoint.")
 
     model.eval()
 
-    # current_lr: use restored value if checkpoint had one, else args.lr
-    current_lr = restored_lr if restored_lr is not None else args.lr
+    # current_lr: use restored value if checkpoint had one (may already be
+    # overridden by --lr above), else fall back to --lr or the default 1e-3.
+    current_lr = restored_lr if restored_lr is not None else (args.lr or 1e-3)
     # Apply it to the optimizer param groups (in case we loaded old-format
     # and the optimizer was freshly constructed).
     for pg in optimizer.param_groups:
