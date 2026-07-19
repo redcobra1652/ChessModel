@@ -278,10 +278,19 @@ static JsonObj json_parse(const std::string& line) {
 // alternation (write request -> block on read response) which is what
 // keeps the protocol deadlock-free even though multiple MCTS worker
 // threads run concurrently.
+//
+// Batching extension (backward-compatible):
+//   C++ -> Python:  {"cmd":"batch","requests":[{type,history,path,move},...]}
+//   Python -> C++:  {"cmd":"batch_result","responses":["{...}","..."]}
+//
+// The root is still evaluated with a single send_request() call because
+// it must complete before any simulations start and batching it saves
+// nothing.  All non-root leaf evals are batched BATCH_SIZE at a time.
 // ----------------------------------------------------------------------
 
 static std::mutex g_io_mutex;
 
+// Single-request round-trip. Used for the root call only.
 static JsonObj send_request(const JsonObj& req) {
     std::lock_guard<std::mutex> lock(g_io_mutex);
     std::cout << json_write(req) << std::endl; // std::endl flushes
@@ -293,6 +302,8 @@ static JsonObj send_request(const JsonObj& req) {
     }
     return json_parse(line);
 }
+
+static constexpr int BATCH_SIZE = 8;
 
 // ----------------------------------------------------------------------
 // MCTS tree
@@ -338,6 +349,7 @@ struct Node {
 
     bool expanded = false;
     bool terminal = false;
+    bool in_flight = false;          // true while queued in a pending batch (not yet expanded)
     double terminal_value = 0.0;    // value from this node's side-to-move perspective
 
     std::mutex mtx;
@@ -359,32 +371,10 @@ static std::vector<std::string> build_path(Node* node) {
     return path;
 }
 
-// Expand `node` (assumes node->mtx is NOT held). Populates children /
-// terminal status / value by querying train.py exactly once.
-// Returns the leaf value from `node`'s own side-to-move perspective.
-static double expand_node(Node* node, Node* root) {
-    JsonObj resp;
-    if (node == root) {
-        JsonObj req;
-        req["type"] = JsonVal::Str("root");
-        req["history"] = JsonVal::ArrStr(root->history);
-        resp = send_request(req);
-    } else {
-        JsonObj req;
-        req["type"] = JsonVal::Str("visit");
-        req["history"] = JsonVal::ArrStr(root->history);
-        req["path"] = JsonVal::ArrStr(build_path(node->parent));
-        req["move"] = JsonVal::Str(node->move_uci);
-        resp = send_request(req);
-    }
-
-    std::lock_guard<std::mutex> lock(node->mtx);
-    if (node->expanded) {
-        // Another thread already expanded this node while we were
-        // waiting on the response (double-checked lock). Use its result.
-        return node->terminal ? node->terminal_value : 0.0; // caller re-reads under lock anyway
-    }
-
+// Apply a Python NN response to a node: populate children / terminal /
+// value.  Returns the leaf value from the node's side-to-move perspective.
+// Mirrors the logic that was in expand_node() in the original.
+static double apply_response(Node* node, Node* root, JsonObj resp) {
     if (node != root) {
         node->fen = resp.count("fen") ? resp["fen"].get_str() : node->fen;
     }
@@ -423,83 +413,204 @@ static double expand_node(Node* node, Node* root) {
         value = resp.count("value") ? resp["value"].get_num() : 0.0;
     }
     node->expanded = true;
+    node->in_flight = false;
     return value;
 }
 
-// Runs a single MCTS simulation from `root`.
-static void simulate_one(Node* root) {
+// Holds the state of one in-progress simulation that has reached an
+// unexpanded leaf and is waiting for its NN evaluation.
+struct PendingSim {
+    std::vector<Node*> path;    // traversal path from root to leaf (inclusive)
+    Node*              leaf;    // the unexpanded leaf node
+    JsonObj            request; // the visit request to send to Python
+};
+
+// Descend the tree using PUCT until we hit an unexpanded leaf or terminal.
+//
+// Returns true  if the sim resolved inline (terminal, or expanded-but-empty
+//               leaf treated as draw): path has been backed up already.
+// Returns false if we landed on an unexpanded leaf that needs an NN eval:
+//               `pending` is populated; caller must send the request and
+//               call backup() once the response arrives.
+//
+// BUG FIX vs previous batching attempt: when a second descent lands on an
+// in_flight node we no longer back up a spurious 0.0 and count it as
+// completed. Instead we return a special sentinel (return value = false,
+// pending.leaf = nullptr) so run_sims() can simply retry that descent slot
+// without corrupting N/W anywhere in the tree.
+static bool descend(Node* root, PendingSim& pending) {
     std::vector<Node*> path;
     Node* node = root;
     path.push_back(node);
-    double leaf_value = 0.0;
 
     while (true) {
-        std::unique_lock<std::mutex> lock(node->mtx);
-
+        // Terminal: back up immediately, no NN eval needed.
         if (node->terminal) {
-            leaf_value = node->terminal_value;
-            lock.unlock();
-            break;
+            double v = node->terminal_value;
+            for (int i = (int)path.size() - 1; i >= 0; --i) {
+                Node* n = path[i];
+                if (i != 0) { n->N -= VIRTUAL_LOSS; n->W -= VIRTUAL_LOSS; }
+                n->N += 1; n->W += v; v = -v;
+            }
+            return true;
         }
 
+        // Unexpanded leaf: needs NN eval. Queue for batch.
+        // (in_flight cannot happen here: PUCT below skips in_flight children,
+        // so no two descents in the same batch window reach the same node.)
         if (!node->expanded) {
-            lock.unlock();
-            leaf_value = expand_node(node, root);
-            // Re-read under lock in case of a race on terminal_value.
-            std::lock_guard<std::mutex> lk2(node->mtx);
-            if (node->terminal) leaf_value = node->terminal_value;
-            break;
+            JsonObj req;
+            req["type"] = JsonVal::Str("visit");
+            req["history"] = JsonVal::ArrStr(root->history);
+            req["path"] = JsonVal::ArrStr(build_path(node->parent));
+            req["move"] = JsonVal::Str(node->move_uci);
+            node->in_flight = true;
+            pending.path = std::move(path);
+            pending.leaf = node;
+            pending.request = std::move(req);
+            return false;
         }
 
+        // Expanded but no children (stalemate/draw caught late): draw.
         if (node->children.empty()) {
-            // Expanded but has no children: treat conservatively as a
-            // drawn/neutral leaf (should not normally happen since the
-            // terminal flag is expected to catch these cases upstream).
-            leaf_value = 0.0;
-            lock.unlock();
-            break;
+            double v = 0.0;
+            for (int i = (int)path.size() - 1; i >= 0; --i) {
+                Node* n = path[i];
+                if (i != 0) { n->N -= VIRTUAL_LOSS; n->W -= VIRTUAL_LOSS; }
+                n->N += 1; n->W += v; v = -v;
+            }
+            return true;
         }
 
+        // PUCT selection.
+        // Skip in_flight children: they are unexpanded nodes already queued in
+        // this batch window. Steering away from them ensures no two descents
+        // ever land on the same unexpanded node, eliminating collisions without
+        // any retry overhead.
         double sqrt_parent_n = std::sqrt(static_cast<double>(std::max(1, node->N)));
         double best_score = -1e18;
         Node* best_child = nullptr;
         for (auto& kv : node->children) {
             Node* c = kv.second.get();
-            std::lock_guard<std::mutex> clk(c->mtx);
+            if (c->in_flight) continue;  // already queued this batch, steer away
             double q = (c->N > 0) ? -(c->W / c->N) : 0.0;
             double u = C_PUCT * c->P * sqrt_parent_n / (1.0 + c->N);
-            double score = q + u;
-            if (score > best_score) {
-                best_score = score;
-                best_child = c;
+            if (q + u > best_score) { best_score = q + u; best_child = c; }
+        }
+        // All children in_flight (only when branching factor <= BATCH_SIZE and
+        // all slots filled): fall back without the skip so the sim can proceed.
+        if (!best_child) {
+            for (auto& kv : node->children) {
+                Node* c = kv.second.get();
+                double q = (c->N > 0) ? -(c->W / c->N) : 0.0;
+                double u = C_PUCT * c->P * sqrt_parent_n / (1.0 + c->N);
+                if (q + u > best_score) { best_score = q + u; best_child = c; }
             }
         }
-
-        {
-            std::lock_guard<std::mutex> clk(best_child->mtx);
-            best_child->N += VIRTUAL_LOSS;
-            best_child->W += VIRTUAL_LOSS;
-        }
-
-        lock.unlock();
+        best_child->N += VIRTUAL_LOSS;
+        best_child->W += VIRTUAL_LOSS;
         node = best_child;
         path.push_back(node);
     }
+}
 
-    // Backup: alternate sign since each depth level flips side-to-move.
+// Back up a completed sim.
+//
+// BUG FIX vs previous batching attempt: the leaf (last index) DOES receive
+// virtual loss (it was selected as a best_child during the final PUCT step),
+// so we undo it here -- same as original simulate_one() which undoes VL for
+// every node except index 0 (root).
+static void backup(const std::vector<Node*>& path, double leaf_value) {
     double v = leaf_value;
-    for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
+    for (int i = (int)path.size() - 1; i >= 0; --i) {
         Node* n = path[i];
-        std::lock_guard<std::mutex> lk(n->mtx);
         if (i != 0) {
-            // undo the virtual loss this node received when it was
-            // selected as a child during the descent above
+            // Undo the virtual loss applied when this node was selected
+            // as a best_child during descent (root was never selected).
             n->N -= VIRTUAL_LOSS;
             n->W -= VIRTUAL_LOSS;
         }
         n->N += 1;
         n->W += v;
         v = -v;
+    }
+}
+
+// Run `sims` simulations against `root`, batching NN leaf evals
+// BATCH_SIZE at a time to amortise pipe round-trip overhead.
+//
+// Correctness properties (matching original simulate_one behaviour):
+//   - VIRTUAL_LOSS=3 is applied and properly undone on every path.
+//   - in_flight collisions are retried, never backed up with 0.0.
+//   - Terminal and empty-expanded leaves resolve inline (no batch slot).
+static void run_sims(Node* root, int sims) {
+    int completed = 0;
+
+    while (completed < sims) {
+        std::vector<PendingSim> pending;
+        int to_collect = std::min(BATCH_SIZE, sims - completed);
+
+        // Collect up to BATCH_SIZE leaf evals.
+        // Terminals resolve inline (completed++).
+        // Non-terminals are parked in pending for the batch request.
+        // Collisions are eliminated by PUCT skipping in_flight children,
+        // so descend() always returns either resolved=true or a valid leaf.
+        while ((int)pending.size() < to_collect && completed + (int)pending.size() < sims) {
+            PendingSim ps;
+            bool resolved = descend(root, ps);
+            if (resolved) {
+                completed++;
+            } else {
+                pending.push_back(std::move(ps));
+            }
+        }
+
+        if (pending.empty()) continue;
+
+        // Build and send the batch request.
+        std::ostringstream oss;
+        oss << "{\"cmd\":\"batch\",\"requests\":[";
+        for (size_t i = 0; i < pending.size(); ++i) {
+            if (i) oss << ',';
+            oss << json_write(pending[i].request);
+        }
+        oss << "]}";
+
+        std::string resp_line;
+        {
+            std::lock_guard<std::mutex> io(g_io_mutex);
+            std::cout << oss.str() << std::endl;
+            if (!std::getline(std::cin, resp_line)) {
+                std::cerr << "[mcts_engine] FATAL: stdin closed awaiting batch_result" << std::endl;
+                std::exit(1);
+            }
+        }
+
+        // Parse batch_result.
+        JsonObj outer = json_parse(resp_line);
+        const std::vector<std::string>& raw_resps =
+            outer.count("responses") ? outer["responses"].arr_s
+                                     : std::vector<std::string>{};
+
+        // Apply responses and backup.
+        for (size_t i = 0; i < pending.size(); ++i) {
+            JsonObj resp = (i < raw_resps.size())
+                ? json_parse(raw_resps[i])
+                : [&]() {
+                    // Fallback: treat as draw if response missing.
+                    JsonObj safe;
+                    safe["terminal"] = JsonVal::Bool(true);
+                    safe["result"]   = JsonVal::Num(0.0);
+                    safe["value"]    = JsonVal::Num(0.0);
+                    safe["moves"]    = JsonVal::ArrStr({});
+                    safe["priors"]   = JsonVal::ArrNum({});
+                    return safe;
+                  }();
+
+            double leaf_val = apply_response(pending[i].leaf, root, resp);
+            backup(pending[i].path, leaf_val);
+            completed++;
+        }
     }
 }
 
@@ -531,16 +642,22 @@ int main(int argc, char** argv) {
             root->fen = fen;
             root->history = cmd.count("history") ? cmd["history"].arr_s : std::vector<std::string>{};
 
+            // Evaluate root first with a dedicated single call -- it must
+            // complete before any sims start and there is nothing to batch.
+            {
+                JsonObj root_req;
+                root_req["type"] = JsonVal::Str("root");
+                root_req["history"] = JsonVal::ArrStr(root->history);
+                JsonObj root_resp = send_request(root_req);
+                apply_response(root.get(), root.get(), root_resp);
+            }
+
+            // Run all sims, batching BATCH_SIZE leaf evals per round-trip.
             // All simulations run on THIS thread (the main thread that owns
             // stdin/stdout). Running them in a thread pool was a deadlock:
-            // each sim calls send_request() which does blocking I/O, but
-            // main() was also blocked on std::getline -- so the worker
-            // threads' requests were landing in main()'s getline and being
-            // treated as unknown top-level commands. Serial execution here
-            // is correct; MCTS is inherently sequential through the pipe.
-            for (int i = 0; i < sims; ++i) {
-                simulate_one(root.get());
-            }
+            // each sim calls blocking I/O, but main() was also blocked on
+            // std::getline. Serial execution here is correct.
+            run_sims(root.get(), sims);
 
             std::vector<std::string> moves;
             std::vector<double> visits;

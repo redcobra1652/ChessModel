@@ -422,6 +422,114 @@ def handle_root(history: list, start_fen: str = None) -> dict:
         return _SAFE_TERMINAL
 
 
+def handle_batch(requests: list, start_fen: str = None) -> list:
+    """Handle a batch of root/visit requests in one call.
+
+    Each request is a dict with the same shape as the individual
+    root/visit protocol messages.  Responses are returned as a list of
+    JSON strings (so the C++ side can deserialise them with its existing
+    per-object parser without needing a new vector-of-object JSON type).
+
+    The key win: all non-terminal positions in the batch are evaluated
+    in a single batched GPU forward pass instead of N separate ones.
+    Terminal positions are handled cheaply in pure Python with no GPU
+    involvement, so they don't dilute the batch.
+    """
+    model = CURRENT_MODEL
+    device = CURRENT_DEVICE
+
+    # --- Phase 1: replay boards and detect terminals ---
+    boards = []
+    results = [None] * len(requests)  # pre-fill; terminals filled here
+
+    for i, req in enumerate(requests):
+        try:
+            if req.get("type") == "root":
+                board = _replay(req.get("history", []), start_fen=start_fen)
+                terminal, result = position_outcome(board)
+                if terminal:
+                    results[i] = {"terminal": True, "result": result,
+                                  "moves": [], "priors": [], "value": result}
+                else:
+                    boards.append((i, board, True))  # (index, board, is_root)
+            else:  # visit
+                board = _replay(req.get("history", []), req.get("path", []), start_fen=start_fen)
+                move = chess.Move.from_uci(req["move"])
+                if move not in board.legal_moves:
+                    log.warning(f"handle_batch: illegal move {req['move']} — returning safe terminal")
+                    results[i] = {"fen": board.fen(), **_SAFE_TERMINAL}
+                    continue
+                board.push(move)
+                child_fen = board.fen()
+                terminal, result = position_outcome(board)
+                if terminal:
+                    results[i] = {"fen": child_fen, "terminal": True, "result": result,
+                                  "moves": [], "priors": [], "value": result}
+                else:
+                    boards.append((i, board, False, child_fen))
+        except Exception as e:
+            log.warning(f"handle_batch: error on request {i} ({e}); returning safe terminal")
+            results[i] = _SAFE_TERMINAL
+
+    # --- Phase 2: batch GPU eval for all non-terminal boards ---
+    if boards and model is not None:
+        try:
+            # Stack all board tensors into one batch.
+            tensors = []
+            for entry in boards:
+                board = entry[1]
+                tensors.append(torch.from_numpy(board_to_tensor(board)))
+            batch_x = torch.stack(tensors).to(device)  # (N, 13, 8, 8)
+
+            with torch.no_grad():
+                batch_logits, batch_values = model(batch_x)
+            batch_logits = batch_logits.cpu().numpy()
+            batch_values = batch_values.squeeze(-1).cpu().numpy()
+
+            for j, entry in enumerate(boards):
+                idx = entry[0]
+                board = entry[1]
+                is_root = entry[2]
+                logits = batch_logits[j]
+                value = float(batch_values[j])
+
+                mirror = board.turn == chess.BLACK
+                legal = list(board.legal_moves)
+                idxs = np.array([move_policy_index(m, mirror) for m in legal], dtype=np.int64)
+                sel = logits[idxs]
+                sel = sel - sel.max()
+                exps = np.exp(sel)
+                priors = (exps / (exps.sum() + 1e-8)).tolist()
+
+                if SELF_PLAY_MODE and is_root and len(legal) > 0:
+                    noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(legal))
+                    priors = ((1 - DIRICHLET_EPS) * np.array(priors)
+                              + DIRICHLET_EPS * noise).tolist()
+
+                move_ucis = [m.uci() for m in legal]
+
+                if len(entry) == 4:  # visit (has child_fen)
+                    child_fen = entry[3]
+                    results[idx] = {"fen": child_fen, "terminal": False, "result": 0.0,
+                                    "moves": move_ucis, "priors": priors, "value": value}
+                else:  # root
+                    results[idx] = {"terminal": False, "result": 0.0,
+                                    "moves": move_ucis, "priors": priors, "value": value}
+        except Exception as e:
+            log.warning(f"handle_batch: GPU eval failed ({e}); falling back to safe terminals")
+            for entry in boards:
+                idx = entry[0]
+                if results[idx] is None:
+                    results[idx] = _SAFE_TERMINAL
+
+    # Fill any remaining None slots (shouldn't happen but defensive).
+    for i in range(len(results)):
+        if results[i] is None:
+            results[i] = _SAFE_TERMINAL
+
+    return [json.dumps(r) for r in results]
+
+
 def handle_visit(history: list, path: list, move_uci: str, start_fen: str = None) -> dict:
     try:
         board = _replay(history, path, start_fen=start_fen)
@@ -514,6 +622,16 @@ def search(proc, board: chess.Board, sims: int, threads: int):
         if obj.get("cmd") == "result":
             visits = dict(zip(obj["moves"], obj["visits"]))
             return visits, obj["value"]
+
+        if obj.get("cmd") == "batch":
+            # Batched eval: one GPU forward pass for all requests.
+            responses = handle_batch(obj.get("requests", []), start_fen=start_fen)
+            # Encode responses as array-of-strings so C++ can parse each
+            # element with its existing per-object JSON parser.
+            encoded = json.dumps({"cmd": "batch_result", "responses": responses})
+            proc.stdin.write(encoded + "\n")
+            proc.stdin.flush()
+            continue
 
         if obj.get("type") == "root":
             resp = handle_root(obj.get("history", []), start_fen=start_fen)
