@@ -1,0 +1,22 @@
+{
+  "selected_tint": [
+    255,
+    255,
+    51,
+    150
+  ],
+  "last_move_tint": [
+    186,
+    202,
+    68,
+    140
+  ],
+  "premove_tint": [
+    244,
+    42,
+    42,
+    150
+  ],
+  "anim_duration_ms": 175,
+  "sims": 1000
+}

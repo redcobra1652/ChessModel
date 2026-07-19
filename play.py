@@ -112,6 +112,47 @@ try:
 except ImportError:
     _HAVE_PYPERCLIP = False
 
+import json as _json
+
+# ----------------------------------------------------------------------
+# Persistent settings  (saved to chess_settings.txt next to play.py)
+# ----------------------------------------------------------------------
+_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "chess_settings.txt")
+
+_SETTINGS_DEFAULTS = {
+    # RGBA tuples for board highlights
+    "selected_tint":  [246, 234, 120, 150],
+    "last_move_tint": [210, 210, 130, 140],
+    "premove_tint":   [70,  130, 230, 150],
+    # Animation speed for the model's piece glide (ms; 0 = instant)
+    "anim_duration_ms": 175,
+    # MCTS simulations per model move (200–2000)
+    "sims": 400,
+}
+
+def _load_settings() -> dict:
+    if os.path.exists(_SETTINGS_PATH):
+        try:
+            with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            merged = dict(_SETTINGS_DEFAULTS)
+            merged.update(data)
+            return merged
+        except Exception as e:
+            print(f"[settings] Could not read chess_settings.txt ({e}); using defaults.")
+    return dict(_SETTINGS_DEFAULTS)
+
+def _save_settings(s: dict):
+    try:
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            _json.dump(s, f, indent=2)
+    except OSError as e:
+        print(f"[settings] Could not save chess_settings.txt: {e}")
+
+# Global mutable settings dict — read at startup, written on any change.
+_CFG = _load_settings()
+
 
 def copy_to_clipboard(text: str) -> bool:
     """Best-effort clipboard copy: pyperclip first, then pygame's own
@@ -131,6 +172,42 @@ def copy_to_clipboard(text: str) -> bool:
         pass
     print(f"[clipboard unavailable] {text}")
     return False
+
+
+def _letterbox_rect(real_screen_size):
+    """Return the pygame.Rect inside the real window where the logical surface
+    is drawn, preserving the fixed logical aspect ratio (letterbox/pillarbox).
+    The board is always square; piece/board proportions never stretch."""
+    rw, rh = real_screen_size
+    # Fit the logical canvas inside the real window while keeping _ASPECT fixed.
+    if rw / rh > _ASPECT:
+        # window is wider than canvas ratio → pillarbox (black bars on sides)
+        h = rh
+        w = int(h * _ASPECT)
+    else:
+        # window is taller than canvas ratio → letterbox (black bars top/bottom)
+        w = rw
+        h = int(w / _ASPECT)
+    x = (rw - w) // 2
+    y = (rh - h) // 2
+    return pygame.Rect(x, y, w, h)
+
+
+def blit_letterboxed(logical, screen):
+    """Scale `logical` into `screen` with black bars, preserving aspect ratio."""
+    screen.fill((0, 0, 0))
+    rect = _letterbox_rect(screen.get_size())
+    scaled = pygame.transform.smoothscale(logical, (rect.width, rect.height))
+    screen.blit(scaled, (rect.x, rect.y))
+
+
+def logical_mouse(real_pos, real_screen_size):
+    """Map a mouse position from real window space to logical (WINDOW_W x WINDOW_H) space,
+    accounting for letterbox offset and scale."""
+    rect = _letterbox_rect(real_screen_size)
+    lx = (real_pos[0] - rect.x) * WINDOW_W / rect.width
+    ly = (real_pos[1] - rect.y) * WINDOW_H / rect.height
+    return (int(lx), int(ly))
 
 
 def build_pgn(board: chess.Board, human_is_white: bool, model_name: str) -> str:
@@ -165,7 +242,10 @@ PIECE_OFFSET = (SQUARE - PIECE_SIZE) // 2
 SIDEBAR_W = 300
 SIDEBAR_X = BOARD_X + BOARD_PX
 WINDOW_W = BOARD_X + BOARD_PX + SIDEBAR_W
-WINDOW_H = BOARD_PX
+WINDOW_H = BOARD_PX   # logical canvas height matches the board exactly
+# Fixed logical aspect ratio used by the letterbox/pillarbox scaler so the
+# board always stays square when the window is resized.
+_ASPECT = WINDOW_W / WINDOW_H
 
 EVAL_BAR_BG = (40, 40, 42)
 EVAL_WHITE_COLOR = (250, 250, 250)
@@ -186,15 +266,14 @@ BOARD_BG_FILES = {
 
 # Semi-transparent tint overlays drawn on top of the board background art
 # for highlighting (selection, last move, premoves, check).
-SELECTED_TINT = (246, 234, 120, 150)
-LAST_MOVE_TINT = (210, 210, 130, 140)
-CHECK_TINT = (220, 90, 80, 150)
-DOT_COLOR = (30, 30, 30, 110)
-RING_COLOR = (30, 30, 30, 140)
-
-# Premove highlighting: chess.com-style solid-ish blue tint on both the
-# start and end square, no destination dots.
-PREMOVE_TINT = (70, 130, 230, 150)
+# These are read from _CFG each frame so the settings screen can change them
+# live without reloading. The CHECK / dot / ring colors are fixed constants.
+def SELECTED_TINT():  return tuple(_CFG["selected_tint"])
+def LAST_MOVE_TINT(): return tuple(_CFG["last_move_tint"])
+def PREMOVE_TINT():   return tuple(_CFG["premove_tint"])
+CHECK_TINT  = (220, 90, 80, 150)
+DOT_COLOR   = (30, 30, 30, 110)
+RING_COLOR  = (30, 30, 30, 140)
 
 PIECE_NAME = {
     chess.PAWN: "pawn",
@@ -430,7 +509,12 @@ def premove_shape_ok(board, premoves, from_sq, to_sq):
 
 def draw_board(screen, board_bg, board, images, flipped, selected_square,
                legal_targets, last_move, dragging_square,
-               premoves, premove_selected_square):
+               premoves, premove_selected_square,
+               anim_piece=None, anim_pixel_pos=None):
+    """Draw the board.  anim_piece / anim_pixel_pos: if set, the model's
+    gliding piece is drawn at the interpolated pixel position instead of
+    its board square (the square it landed on is skipped in the normal
+    piece loop so it doesn't render twice)."""
     screen.blit(board_bg, (BOARD_X, 0))
 
     def tint(square, color):
@@ -440,20 +524,20 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
         screen.blit(overlay, (x, y))
 
     if last_move is not None:
-        tint(last_move.from_square, LAST_MOVE_TINT)
-        tint(last_move.to_square, LAST_MOVE_TINT)
+        tint(last_move.from_square, LAST_MOVE_TINT())
+        tint(last_move.to_square,   LAST_MOVE_TINT())
 
     # Premove highlighting: chess.com-style -- both squares filled blue,
     # no destination dots, whether still being chosen or already queued.
     # Several premoves can be queued at once; all of them light up.
     for from_sq, to_sq in premoves:
-        tint(from_sq, PREMOVE_TINT)
-        tint(to_sq, PREMOVE_TINT)
+        tint(from_sq, PREMOVE_TINT())
+        tint(to_sq,   PREMOVE_TINT())
     if premove_selected_square is not None:
-        tint(premove_selected_square, PREMOVE_TINT)
+        tint(premove_selected_square, PREMOVE_TINT())
 
     if selected_square is not None:
-        tint(selected_square, SELECTED_TINT)
+        tint(selected_square, SELECTED_TINT())
 
     if board.is_check():
         king_sq = board.king(board.turn)
@@ -464,24 +548,27 @@ def draw_board(screen, board_bg, board, images, flipped, selected_square,
             screen.blit(glow, (x, y))
 
     # pieces (skip the one currently being dragged; drawn on top separately).
-    # If premoves are queued, render them optimistically in order: each
-    # piece hops to its premove's target square immediately, chess.com-
-    # style, purely for display -- the real board underneath is untouched.
-    # Once a premove resolves (fires because it turned out legal, so the
-    # real board catches up, or gets silently discarded -- along with the
-    # rest of the queue -- because it didn't), this same map is simply
-    # rebuilt from the unchanged real board next frame, so any premoved
-    # pieces visually snap back to their original squares on their own.
+    # Also skip the animating piece's destination square — it's drawn below
+    # at its interpolated position instead.
     piece_map = compute_premove_piece_map(board, premoves)
+    anim_sq   = last_move.to_square if (anim_piece is not None and last_move is not None) else None
 
     for square in chess.SQUARES:
         if square == dragging_square:
             continue
+        if anim_piece is not None and square == anim_sq:
+            continue   # drawn separately at interpolated position
         piece = piece_map.get(square)
         if piece is None:
             continue
         x, y = square_to_pixel(square, flipped)
         screen.blit(images[(piece.color, piece.piece_type)], (x + PIECE_OFFSET, y + PIECE_OFFSET))
+
+    # Animated model piece — glides from source to destination square.
+    if anim_piece is not None and anim_pixel_pos is not None:
+        ax, ay = anim_pixel_pos
+        screen.blit(images[(anim_piece.color, anim_piece.piece_type)],
+                    (ax + PIECE_OFFSET, ay + PIECE_OFFSET))
 
     # legal-move indicators (real moves only -- premoves intentionally show no dots)
     for target in legal_targets:
@@ -537,7 +624,7 @@ def draw_button(screen, font, rect, label, hovered=False):
     screen.blit(text, text.get_rect(center=rect.center))
 
 
-def draw_popup(screen, font, big_font, result_text, pgn_copied):
+def draw_popup(screen, font, big_font, result_text, pgn_copied, mouse_pos=(0, 0)):
     overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, 140))
     screen.blit(overlay, (0, 0))
@@ -551,7 +638,6 @@ def draw_popup(screen, font, big_font, result_text, pgn_copied):
     result_label = font.render(result_text or "", True, (255, 210, 90))
     screen.blit(result_label, result_label.get_rect(center=(POPUP_RECT.centerx, POPUP_RECT.top + 84)))
 
-    mouse_pos = pygame.mouse.get_pos()
     draw_button(screen, font, COPY_PGN_BTN_RECT, "Copy PGN", COPY_PGN_BTN_RECT.collidepoint(mouse_pos))
     draw_button(screen, font, POPUP_ANALYSIS_BTN_RECT, "Analysis",
                 POPUP_ANALYSIS_BTN_RECT.collidepoint(mouse_pos))
@@ -569,7 +655,7 @@ def draw_popup(screen, font, big_font, result_text, pgn_copied):
 
 def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
                   thinking, san_history, result_text, premoves, show_eval_bar,
-                  moves_scroll):
+                  moves_scroll, mouse_pos=(0, 0)):
     pygame.draw.rect(screen, SIDEBAR_BG, (SIDEBAR_X, 0, SIDEBAR_W, WINDOW_H))
     pad = 18
     y = pad
@@ -656,7 +742,6 @@ def draw_sidebar(screen, font, big_font, board, human_is_white, model_name,
         screen.blit(hint, (SIDEBAR_X + pad, min(y, EVAL_TOGGLE_RECT.top - 22)))
 
     # Resign button — only shown while the game is still in progress.
-    mouse_pos = pygame.mouse.get_pos()
     if not result_text:
         resign_hov = RESIGN_BTN_RECT.collidepoint(mouse_pos)
         pygame.draw.rect(screen,
@@ -689,7 +774,7 @@ ANALYSIS_BG = (15, 16, 20, 235)
 ANALYSIS_ROW_H = 66
 
 
-def draw_analysis(screen, font, big_font, move_analysis, scroll):
+def draw_analysis(screen, font, big_font, move_analysis, scroll, mouse_pos=(0, 0)):
     overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
     overlay.fill(ANALYSIS_BG)
     screen.blit(overlay, (0, 0))
@@ -697,7 +782,6 @@ def draw_analysis(screen, font, big_font, move_analysis, scroll):
     title = big_font.render("Game Analysis", True, (245, 245, 245))
     screen.blit(title, (30, 20))
 
-    mouse_pos = pygame.mouse.get_pos()
     close_hovered = ANALYSIS_CLOSE_BTN_RECT.collidepoint(mouse_pos)
     pygame.draw.rect(screen, (90, 95, 105) if close_hovered else (70, 74, 84),
                       ANALYSIS_CLOSE_BTN_RECT, border_radius=6)
@@ -806,7 +890,7 @@ def draw_eval_bar(screen, eval_font, eval_white, show, human_is_white, thinking=
 # Promotion picker (small blocking modal loop)
 # ----------------------------------------------------------------------
 
-def prompt_promotion(screen, clock, images, color, background_draw_fn):
+def prompt_promotion(screen, logical, clock, images, color, background_draw_fn):
     box_w, box_h = SQUARE * len(PROMOTION_CHOICES), SQUARE
     box_x = BOARD_X + (BOARD_PX - box_w) // 2
     box_y = (WINDOW_H - box_h) // 2
@@ -816,26 +900,29 @@ def prompt_promotion(screen, clock, images, color, background_draw_fn):
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit(0)
+            if event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             if event.type == pygame.MOUSEBUTTONDOWN:
-                mx, my = event.pos
+                mx, my = logical_mouse(event.pos, screen.get_size())
                 if box_y <= my <= box_y + box_h and box_x <= mx <= box_x + box_w:
                     idx = (mx - box_x) // SQUARE
                     if 0 <= idx < len(PROMOTION_CHOICES):
                         return PROMOTION_CHOICES[idx]
 
-        background_draw_fn()
+        background_draw_fn()   # draws onto logical
 
         overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 120))
-        screen.blit(overlay, (0, 0))
+        logical.blit(overlay, (0, 0))
 
-        pygame.draw.rect(screen, (250, 250, 250), (box_x - 6, box_y - 6, box_w + 12, box_h + 12),
+        pygame.draw.rect(logical, (250, 250, 250), (box_x - 6, box_y - 6, box_w + 12, box_h + 12),
                           border_radius=10)
         for i, pt in enumerate(PROMOTION_CHOICES):
             x = box_x + i * SQUARE
-            pygame.draw.rect(screen, (225, 225, 225), (x, box_y, SQUARE, SQUARE))
-            screen.blit(images[(color, pt)], (x + PIECE_OFFSET, box_y + PIECE_OFFSET))
+            pygame.draw.rect(logical, (225, 225, 225), (x, box_y, SQUARE, SQUARE))
+            logical.blit(images[(color, pt)], (x + PIECE_OFFSET, box_y + PIECE_OFFSET))
 
+        blit_letterboxed(logical, screen)
         pygame.display.flip()
         clock.tick(60)
 
@@ -999,10 +1086,10 @@ def draw_home_screen(screen, font, big_font, title_font, buttons, hovered,
     cx = WINDOW_W // 2
 
     title_surf = title_font.render("Chess vs Model", True, _HOME_TITLE)
-    screen.blit(title_surf, (cx - title_surf.get_width() // 2, 120))
+    screen.blit(title_surf, (cx - title_surf.get_width() // 2, 110))
 
-    sub_surf = font.render("Choose how to start", True, _HOME_SUBTITLE)
-    screen.blit(sub_surf, (cx - sub_surf.get_width() // 2, 170))
+    sub_surf = big_font.render("Choose a game mode to begin", True, _HOME_SUBTITLE)
+    screen.blit(sub_surf, (cx - sub_surf.get_width() // 2, 168))
 
     if error_text:
         # Wrap long messages (e.g. an exception string) across a couple
@@ -1104,10 +1191,11 @@ def model_move_worker(proc, board_snapshot, sims, threads, result_queue, epoch):
 # ----------------------------------------------------------------------
 
 class Game:
-    def __init__(self, args, screen, font, big_font, eval_font, images, sounds,
+    def __init__(self, args, screen, logical, font, big_font, eval_font, images, sounds,
                  board_backgrounds, proc, start_fen=None):
         self.args = args
         self.screen = screen
+        self.logical = logical   # fixed-res surface; all drawing goes here
         self.font = font
         self.big_font = big_font
         self.eval_font = eval_font
@@ -1171,6 +1259,13 @@ class Game:
         self.search_epoch = 0
 
         self.pgn_copied_at = None  # timestamp (ms) of the last "Copy PGN" click
+
+        # Model-piece glide animation state
+        self._anim_piece      = None   # chess.Piece being animated
+        self._anim_from_px    = (0, 0) # pixel start (source square centre)
+        self._anim_to_px      = (0, 0) # pixel end   (dest square centre)
+        self._anim_start_ms   = 0      # pygame.time.get_ticks() when anim began
+        self._anim_duration   = 0      # total ms for this glide
 
         self.reset_game()
 
@@ -1288,7 +1383,7 @@ class Game:
             # multiple candidates only happens for underpromotion choices
             piece = self.board.piece_at(from_sq)
             chosen_pt = prompt_promotion(
-                self.screen, pygame.time.Clock(), self.images, piece.color,
+                self.screen, self.logical, pygame.time.Clock(), self.images, piece.color,
                 background_draw_fn=self.draw_frame,
             )
             move = next(m for m in candidates if m.promotion == chosen_pt)
@@ -1307,6 +1402,9 @@ class Game:
         is_capture = self.board.is_capture(move)
         is_castle = self.board.is_castling(move)
         is_promo = move.promotion is not None
+
+        # Capture the piece *before* push so we know what's moving.
+        moving_piece = self.board.piece_at(move.from_square)
 
         san = self.board.san(move)
         self.board.push(move)
@@ -1341,6 +1439,19 @@ class Game:
             if not self.result_text:
                 self.kick_off_model_move()
         else:
+            # Start glide animation for the model's piece.
+            dur = int(_CFG.get("anim_duration_ms", 175))
+            if dur > 0 and moving_piece is not None:
+                fx, fy = square_to_pixel(move.from_square, self.flipped)
+                tx, ty = square_to_pixel(move.to_square,   self.flipped)
+                self._anim_piece    = moving_piece
+                self._anim_from_px  = (fx, fy)
+                self._anim_to_px    = (tx, ty)
+                self._anim_start_ms = pygame.time.get_ticks()
+                self._anim_duration = dur
+            else:
+                self._anim_piece = None
+
             # The model just moved -- it's now genuinely the human's turn,
             # so any in-progress (not-yet-finalized) premove selection is
             # stale and shouldn't keep showing. If a premove is queued,
@@ -1691,27 +1802,55 @@ class Game:
     # ---------------- drawing ----------------
 
     def draw_frame(self):
-        self.screen.fill((0, 0, 0))
-        draw_eval_bar(self.screen, self.eval_font, self.eval_white, self.show_eval_bar,
+        surf = self.logical
+        surf.fill((0, 0, 0))
+        draw_eval_bar(surf, self.eval_font, self.eval_white, self.show_eval_bar,
                       self.human_is_white, thinking=self.thinking)
-        draw_board(self.screen, self.board_bg, self.board, self.images, self.flipped,
+
+        # Compute glide animation progress (eased).
+        anim_piece = None
+        anim_pixel_pos = None
+        if self._anim_piece is not None:
+            elapsed = pygame.time.get_ticks() - self._anim_start_ms
+            if elapsed < self._anim_duration:
+                t = elapsed / self._anim_duration
+                # Smooth-out ease: t^2*(3-2t)
+                t = t * t * (3 - 2 * t)
+                fx, fy = self._anim_from_px
+                tx, ty = self._anim_to_px
+                anim_piece     = self._anim_piece
+                anim_pixel_pos = (int(fx + (tx - fx) * t),
+                                  int(fy + (ty - fy) * t))
+            else:
+                self._anim_piece = None   # animation finished
+
+        draw_board(surf, self.board_bg, self.board, self.images, self.flipped,
                    self.selected_square, self.legal_targets, self.last_move,
-                   self.dragging_square, self.premoves, self.premove_selected_square)
-        draw_dragging_piece(self.screen, self.images, self.board, self.premoves,
-                             self.dragging_square, pygame.mouse.get_pos())
+                   self.dragging_square, self.premoves, self.premove_selected_square,
+                   anim_piece=anim_piece, anim_pixel_pos=anim_pixel_pos)
+        # Map real mouse pos → logical space for the dragged-piece cursor
+        lmouse = logical_mouse(pygame.mouse.get_pos(), self.screen.get_size())
+        draw_dragging_piece(surf, self.images, self.board, self.premoves,
+                             self.dragging_square, lmouse)
         self.moves_max_scroll = draw_sidebar(
-            self.screen, self.font, self.big_font, self.board, self.human_is_white,
+            surf, self.font, self.big_font, self.board, self.human_is_white,
             self.args.model, self.thinking, self.san_history, self.result_text,
-            self.premoves, self.show_eval_bar, self.moves_scroll)
+            self.premoves, self.show_eval_bar, self.moves_scroll, mouse_pos=lmouse)
 
         if self.result_text is not None:
             pgn_copied = self.pgn_copied_at is not None and \
                 pygame.time.get_ticks() - self.pgn_copied_at < 2000
-            draw_popup(self.screen, self.font, self.big_font, self.result_text, pgn_copied)
+            draw_popup(surf, self.font, self.big_font, self.result_text, pgn_copied,
+                       mouse_pos=lmouse)
 
         if self.show_analysis:
             self.analysis_max_scroll = draw_analysis(
-                self.screen, self.font, self.big_font, self.move_analysis, self.analysis_scroll)
+                surf, self.font, self.big_font, self.move_analysis, self.analysis_scroll,
+                mouse_pos=lmouse)
+
+        # Scale the finished logical frame up (smoothly) to the real window,
+        # preserving aspect ratio with black bars (letterbox / pillarbox).
+        blit_letterboxed(surf, self.screen)
 
 
 # ----------------------------------------------------------------------
@@ -1742,7 +1881,7 @@ _SETUP_ERR    = (220, 80, 80)
 _SETUP_OK     = (80, 200, 120)
 
 
-def _run_setup_screen(screen, clock, font, big_font, title_font,
+def _run_setup_screen(screen, logical, clock, font, big_font, title_font,
                       images, sounds, board_backgrounds, args):
     """
     Interactive board editor. The user drags pieces from a sidebar palette
@@ -1799,11 +1938,11 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
     error_msg = ""
 
     def draw_setup():
-        screen.fill(_SETUP_BG)
+        logical.fill(_SETUP_BG)
 
         # Board background
         bg_key = "black" if flipped else "white"
-        screen.blit(board_backgrounds[bg_key], (BOARD_X, 0))
+        logical.blit(board_backgrounds[bg_key], (BOARD_X, 0))
 
         # Pieces on board
         for sq in chess.SQUARES:
@@ -1813,44 +1952,45 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
             if piece is None:
                 continue
             px, py = square_to_pixel(sq, flipped)
-            screen.blit(images[(piece.color, piece.piece_type)],
+            logical.blit(images[(piece.color, piece.piece_type)],
                         (px + PIECE_OFFSET, py + PIECE_OFFSET))
 
         # Sidebar background
-        pygame.draw.rect(screen, _SETUP_SB_BG, (sb_x, 0, sb_w, WINDOW_H))
+        pygame.draw.rect(logical, _SETUP_SB_BG, (sb_x, 0, sb_w, WINDOW_H))
 
         # Title
         t = big_font.render("Set Up Position", True, _SETUP_LABEL)
-        screen.blit(t, (sb_x + sb_pad, 16))
+        logical.blit(t, (sb_x + sb_pad, 16))
         h = font.render("Drag pieces onto the board", True, _SETUP_HINT)
-        screen.blit(h, (sb_x + sb_pad, 44))
+        logical.blit(h, (sb_x + sb_pad, 44))
 
         # Palette
         for idx, (color, pt) in enumerate(_SETUP_PIECES):
             r = palette_rect(idx)
-            pygame.draw.rect(screen, (50, 54, 64), r, border_radius=6)
+            pygame.draw.rect(logical, (50, 54, 64), r, border_radius=6)
             img = images[(color, pt)]
             scaled = pygame.transform.smoothscale(img, (palette_cell - 6, palette_cell - 6))
-            screen.blit(scaled, (r.x + 3, r.y + 3))
+            logical.blit(scaled, (r.x + 3, r.y + 3))
 
         # Hint text below palette
         hint_y = 70 + 2 * palette_cell + 8
         for line in ["Right-click board to remove piece",
                      "Tab = flip board"]:
             surf = font.render(line, True, _SETUP_HINT)
-            screen.blit(surf, (sb_x + sb_pad, hint_y))
+            logical.blit(surf, (sb_x + sb_pad, hint_y))
             hint_y += 20
 
-        mouse_pos = pygame.mouse.get_pos()
+        # Translate real mouse → logical for hover detection
+        mouse_pos = logical_mouse(pygame.mouse.get_pos(), screen.get_size())
 
         # Flip / Clear buttons
         for rect, label in ((btn_flip, "Flip Board"), (btn_clear, "Clear Board")):
             hov = rect.collidepoint(mouse_pos)
-            pygame.draw.rect(screen, (68, 74, 88) if hov else (48, 52, 60),
+            pygame.draw.rect(logical, (68, 74, 88) if hov else (48, 52, 60),
                              rect, border_radius=8)
-            pygame.draw.rect(screen, (80, 88, 105), rect, width=1, border_radius=8)
+            pygame.draw.rect(logical, (80, 88, 105), rect, width=1, border_radius=8)
             s = font.render(label, True, (235, 235, 235))
-            screen.blit(s, s.get_rect(center=rect.center))
+            logical.blit(s, s.get_rect(center=rect.center))
 
         # Start buttons
         for rect, label, col in (
@@ -1859,21 +1999,21 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
         ):
             hov = rect.collidepoint(mouse_pos)
             bg = tuple(min(255, c + 20) for c in col) if hov else col
-            pygame.draw.rect(screen, bg, rect, border_radius=8)
-            pygame.draw.rect(screen, (80, 88, 105), rect, width=1, border_radius=8)
+            pygame.draw.rect(logical, bg, rect, border_radius=8)
+            pygame.draw.rect(logical, (80, 88, 105), rect, width=1, border_radius=8)
             s = font.render(label, True, (235, 235, 235))
-            screen.blit(s, s.get_rect(center=rect.center))
+            logical.blit(s, s.get_rect(center=rect.center))
 
         # Error / status message
         if error_msg:
             err_surf = font.render(error_msg, True, _SETUP_ERR)
-            screen.blit(err_surf, (sb_x + sb_pad, btn_y - 28))
+            logical.blit(err_surf, (sb_x + sb_pad, btn_y - 28))
 
-        # Dragged piece follows the cursor
+        # Dragged piece follows the cursor (drag_mouse_pos is already in logical space)
         if drag_piece is not None:
             img = images[(drag_piece.color, drag_piece.piece_type)]
             rect = img.get_rect(center=drag_mouse_pos)
-            screen.blit(img, rect)
+            logical.blit(img, rect)
 
     def try_start(human_color):
         """Validate and return FEN, or None + set error_msg on failure."""
@@ -1920,6 +2060,8 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return None
+            elif event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_q:
                     return None
@@ -1927,57 +2069,58 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
                     flipped = not flipped
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                mx, my = event.pos
-                drag_mouse_pos = event.pos
+                lpos = logical_mouse(event.pos, screen.get_size())
+                drag_mouse_pos = lpos   # already in logical space
 
                 if event.button == 3:  # right-click removes a board piece
-                    sq = pixel_to_square(event.pos, flipped)
+                    sq = pixel_to_square(lpos, flipped)
                     if sq is not None:
                         setup_board.remove_piece_at(sq)
 
                 elif event.button == 1:
                     # Check UI buttons first
-                    if btn_white.collidepoint(event.pos):
+                    if btn_white.collidepoint(lpos):
                         fen = try_start("white")
                         if fen:
                             args.color = "white"
                             return fen
                         continue
-                    if btn_black.collidepoint(event.pos):
+                    if btn_black.collidepoint(lpos):
                         fen = try_start("black")
                         if fen:
                             args.color = "black"
                             return fen
                         continue
-                    if btn_clear.collidepoint(event.pos):
+                    if btn_clear.collidepoint(lpos):
                         setup_board.clear()
                         error_msg = ""
                         continue
-                    if btn_flip.collidepoint(event.pos):
+                    if btn_flip.collidepoint(lpos):
                         flipped = not flipped
                         continue
 
                     # Palette pick-up
                     for idx, (color, pt) in enumerate(_SETUP_PIECES):
                         r = palette_rect(idx)
-                        if r.collidepoint(event.pos):
+                        if r.collidepoint(lpos):
                             drag_piece    = chess.Piece(pt, color)
                             drag_from_sq  = None
                             break
                     else:
                         # Board pick-up
-                        sq = pixel_to_square(event.pos, flipped)
+                        sq = pixel_to_square(lpos, flipped)
                         if sq is not None and setup_board.piece_at(sq) is not None:
                             drag_piece   = setup_board.piece_at(sq)
                             drag_from_sq = sq
                             setup_board.remove_piece_at(sq)
 
             elif event.type == pygame.MOUSEMOTION:
-                drag_mouse_pos = event.pos
+                drag_mouse_pos = logical_mouse(event.pos, screen.get_size())
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if drag_piece is not None:
-                    sq = pixel_to_square(event.pos, flipped)
+                    lpos = logical_mouse(event.pos, screen.get_size())
+                    sq = pixel_to_square(lpos, flipped)
                     if sq is not None:
                         # Place piece (replaces whatever was there)
                         setup_board.set_piece_at(sq, drag_piece)
@@ -1988,10 +2131,474 @@ def _run_setup_screen(screen, clock, font, big_font, title_font,
                     drag_from_sq = None
 
         draw_setup()
+        blit_letterboxed(logical, screen)
         pygame.display.flip()
         clock.tick(60)
 
     return None
+
+
+def _hex_to_rgba(hex_str: str, alpha: int) -> tuple | None:
+    """Parse '#RRGGBB' or 'RRGGBB' into (R,G,B,alpha).  Returns None on error."""
+    h = hex_str.strip().lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (r, g, b, alpha)
+    except ValueError:
+        return None
+
+
+def _rgba_to_hex(rgba) -> str:
+    return "#{:02X}{:02X}{:02X}".format(int(rgba[0]), int(rgba[1]), int(rgba[2]))
+
+
+def _run_settings_screen(screen, logical, clock, font, big_font, title_font, args):
+    """
+    Settings screen with:
+      - Three colour rows (selected, last-move, premove):
+          label  |  swatch (click to open HSV picker)  |  hex text input
+      - Animation speed: numeric text input
+      - Difficulty (sims 200-2000): draggable slider
+    Changes are saved to chess_settings.txt on "Save".
+    """
+    global _CFG
+
+    # ── colours ─────────────────────────────────────────────────────────
+    _BG        = (20, 22, 28)
+    _CARD_BG   = (28, 31, 38)
+    _LABEL_COL = (200, 205, 215)
+    _HINT_COL  = (110, 115, 135)
+    _INPUT_BG  = (38, 42, 52)
+
+    # ── geometry ─────────────────────────────────────────────────────────
+    # Two-column layout: labels on the left half, controls on the right.
+    PAD       = 36
+    COL_SPLIT = 310          # x where controls start (right of labels)
+    ROW_H     = 62
+    ROW_GAP   = 10
+    INPUT_H   = 34
+    SWATCH_S  = 32
+    INPUT_W   = 110
+    SLIDER_H  = 8
+
+    cx = WINDOW_W // 2
+
+    # colour rows: (cfg_key, display_label, preserved_alpha)
+    rows = [
+        ("selected_tint",  "Selected square",  int(_CFG["selected_tint"][3])),
+        ("last_move_tint", "Last move squares", int(_CFG["last_move_tint"][3])),
+        ("premove_tint",   "Premove squares",   int(_CFG["premove_tint"][3])),
+    ]
+
+    # ── mutable state ────────────────────────────────────────────────────
+    row_hex    = [_rgba_to_hex(_CFG[k]) for k, _, _ in rows]
+    row_valid  = [True] * len(rows)
+    row_active = [False] * len(rows)   # hex input focused
+
+    anim_text   = str(int(_CFG.get("anim_duration_ms", 175)))
+    anim_active = False
+    anim_valid  = True
+
+    sims_val    = max(200, min(2000, int(_CFG.get("sims", args.sims))))
+
+    # HSV colour-picker popup state
+    # picker_for = row index (0-2) or None
+    picker_for   = None
+    picker_h     = 0.0   # 0-360
+    picker_s     = 1.0   # 0-1
+    picker_v     = 1.0   # 0-1
+    drag_sv      = False  # dragging inside the SV square
+    drag_hue     = False  # dragging the hue bar
+    PICK_W, PICK_H = 260, 290
+    SV_SIZE      = 200
+    HUE_H        = 18
+
+    def _open_picker(i):
+        nonlocal picker_for, picker_h, picker_s, picker_v
+        picker_for = i
+        parsed = _hex_to_rgba(row_hex[i], 255)
+        if parsed:
+            import colorsys
+            r, g, b = parsed[0]/255, parsed[1]/255, parsed[2]/255
+            picker_h, picker_s, picker_v = colorsys.rgb_to_hsv(r, g, b)
+            picker_h *= 360
+
+    def _picker_rect():
+        px = COL_SPLIT + SWATCH_S + 12 + INPUT_W + 16
+        # keep it on screen
+        if px + PICK_W > WINDOW_W - 10:
+            px = WINDOW_W - PICK_W - 10
+        return pygame.Rect(px, 140, PICK_W, PICK_H)
+
+    def _sv_rect():
+        pr = _picker_rect()
+        return pygame.Rect(pr.x + 10, pr.y + 10, SV_SIZE, SV_SIZE)
+
+    def _hue_rect():
+        pr = _picker_rect()
+        return pygame.Rect(pr.x + 10, pr.y + 10 + SV_SIZE + 14, SV_SIZE, HUE_H)
+
+    def _hsv_to_rgb_int(h, s, v):
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(h / 360, s, v)
+        return int(r*255), int(g*255), int(b*255)
+
+    def _apply_picker_to_row():
+        if picker_for is None: return
+        r, g, b = _hsv_to_rgb_int(picker_h, picker_s, picker_v)
+        row_hex[picker_for] = "#{:02X}{:02X}{:02X}".format(r, g, b)
+        row_valid[picker_for] = True
+
+    def _draw_picker(surf):
+        import colorsys
+        pr = _picker_rect()
+        pygame.draw.rect(surf, (40, 44, 54), pr, border_radius=10)
+        pygame.draw.rect(surf, (90, 95, 110), pr, width=1, border_radius=10)
+
+        sv = _sv_rect()
+        # Draw SV square: for each column compute hue+s colour, blend with black/white
+        hue_rgb = _hsv_to_rgb_int(picker_h, 1.0, 1.0)
+        # Render as a surface for speed
+        sv_surf = pygame.Surface((SV_SIZE, SV_SIZE))
+        for xi in range(SV_SIZE):
+            s_val = xi / (SV_SIZE - 1)
+            for yi in range(SV_SIZE):
+                v_val = 1.0 - yi / (SV_SIZE - 1)
+                r, g, b = _hsv_to_rgb_int(picker_h, s_val, v_val)
+                sv_surf.set_at((xi, yi), (r, g, b))
+        surf.blit(sv_surf, sv.topleft)
+        # crosshair
+        cx_pos = int(picker_s * (SV_SIZE - 1)) + sv.x
+        cy_pos = int((1 - picker_v) * (SV_SIZE - 1)) + sv.y
+        pygame.draw.circle(surf, (255,255,255), (cx_pos, cy_pos), 6, 2)
+        pygame.draw.circle(surf, (0,0,0),       (cx_pos, cy_pos), 8, 1)
+
+        # Hue bar
+        hr = _hue_rect()
+        hue_surf = pygame.Surface((SV_SIZE, HUE_H))
+        for xi in range(SV_SIZE):
+            h_val = xi / (SV_SIZE - 1) * 360
+            r, g, b = _hsv_to_rgb_int(h_val, 1.0, 1.0)
+            pygame.draw.line(hue_surf, (r,g,b), (xi,0), (xi, HUE_H-1))
+        surf.blit(hue_surf, hr.topleft)
+        # hue cursor
+        hx = int(picker_h / 360 * (SV_SIZE - 1)) + hr.x
+        pygame.draw.rect(surf, (255,255,255), pygame.Rect(hx-3, hr.y-2, 6, HUE_H+4), border_radius=2)
+
+        # Preview swatch + hex
+        r, g, b = _hsv_to_rgb_int(picker_h, picker_s, picker_v)
+        prev_y = hr.bottom + 14
+        pygame.draw.rect(surf, (r,g,b),
+                         pygame.Rect(pr.x+10, prev_y, 40, 28), border_radius=5)
+        hex_str = "#{:02X}{:02X}{:02X}".format(r,g,b)
+        hs = font.render(hex_str, True, (210,215,225))
+        surf.blit(hs, (pr.x+60, prev_y+6))
+
+        # Close hint
+        cl = font.render("Click outside to close", True, (100,105,120))
+        surf.blit(cl, (pr.x + (PICK_W - cl.get_width())//2, pr.bottom - 22))
+
+    # ── layout helpers ────────────────────────────────────────────────────
+    def row_y(i):
+        return 140 + i * (ROW_H + ROW_GAP)
+
+    def swatch_rect(i):
+        return pygame.Rect(COL_SPLIT, row_y(i) + (ROW_H - SWATCH_S)//2, SWATCH_S, SWATCH_S)
+
+    def input_rect(i):
+        return pygame.Rect(COL_SPLIT + SWATCH_S + 12, row_y(i) + (ROW_H - INPUT_H)//2,
+                           INPUT_W, INPUT_H)
+
+    # rows for anim and sims sit below the colour rows
+    extra_y0  = row_y(len(rows)) + 36
+    anim_y    = extra_y0
+    sims_y    = extra_y0 + ROW_H + ROW_GAP
+
+    anim_input = pygame.Rect(COL_SPLIT, anim_y + (ROW_H - INPUT_H)//2, INPUT_W, INPUT_H)
+
+    # slider track rect — wider so the end labels fit without crowding
+    SLIDER_W  = WINDOW_W - 2 * PAD - COL_SPLIT + PAD - 20
+    sims_track  = pygame.Rect(COL_SPLIT, sims_y + (ROW_H - SLIDER_H)//2, SLIDER_W, SLIDER_H)
+    SIMS_MIN, SIMS_MAX = 200, 2000
+    dragging_slider = False
+
+    save_btn = pygame.Rect(cx - 90, WINDOW_H - 62, 180, 40)
+    back_btn = pygame.Rect(PAD,     WINDOW_H - 62, 110, 40)
+
+    status_msg   = ""
+    status_color = (120, 200, 130)
+
+    def sims_knob_x():
+        t = (sims_val - SIMS_MIN) / (SIMS_MAX - SIMS_MIN)
+        return int(sims_track.x + t * sims_track.width)
+
+    def x_to_sims(x):
+        t = max(0.0, min(1.0, (x - sims_track.x) / sims_track.width))
+        raw = SIMS_MIN + t * (SIMS_MAX - SIMS_MIN)
+        return int(round(raw / 50) * 50)   # snap to nearest 50
+
+    def commit():
+        nonlocal status_msg, status_color, anim_valid
+        ok = True
+        for i, (key, _, alpha) in enumerate(rows):
+            parsed = _hex_to_rgba(row_hex[i], alpha)
+            if parsed is None:
+                row_valid[i] = False; ok = False
+            else:
+                row_valid[i] = True
+                _CFG[key] = list(parsed)
+        try:
+            v = int(anim_text)
+            if v < 0: raise ValueError
+            anim_valid = True
+            _CFG["anim_duration_ms"] = v
+        except ValueError:
+            anim_valid = False; ok = False
+
+        _CFG["sims"]  = sims_val
+        args.sims     = sims_val   # apply immediately for current session
+
+        if ok:
+            _save_settings(_CFG)
+            status_msg   = "Saved to chess_settings.txt"
+            status_color = (120, 200, 130)
+        else:
+            status_msg   = "Fix highlighted fields before saving"
+            status_color = (220, 100, 100)
+
+    # ── main loop ────────────────────────────────────────────────────────
+    running = True
+    while running:
+        mpos = logical_mouse(pygame.mouse.get_pos(), screen.get_size())
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    if picker_for is not None:
+                        _apply_picker_to_row()
+                        picker_for = None
+                    else:
+                        running = False
+                elif event.key == pygame.K_RETURN:
+                    if picker_for is not None:
+                        _apply_picker_to_row(); picker_for = None
+                    else:
+                        commit()
+                elif event.key == pygame.K_BACKSPACE:
+                    for i in range(len(rows)):
+                        if row_active[i]: row_hex[i] = row_hex[i][:-1]
+                    if anim_active: anim_text = anim_text[:-1]
+                elif event.unicode and event.unicode.isprintable():
+                    for i in range(len(rows)):
+                        if row_active[i]: row_hex[i] += event.unicode
+                    if anim_active: anim_text += event.unicode
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                lpos = logical_mouse(event.pos, screen.get_size())
+
+                # picker open: handle clicks inside it
+                if picker_for is not None:
+                    sv = _sv_rect(); hr = _hue_rect(); pr = _picker_rect()
+                    if sv.collidepoint(lpos):
+                        drag_sv = True
+                        picker_s = max(0.0,min(1.0,(lpos[0]-sv.x)/(SV_SIZE-1)))
+                        picker_v = max(0.0,min(1.0,1-(lpos[1]-sv.y)/(SV_SIZE-1)))
+                        _apply_picker_to_row()
+                    elif hr.collidepoint(lpos):
+                        drag_hue = True
+                        picker_h = max(0.0,min(360.0,(lpos[0]-hr.x)/(SV_SIZE-1)*360))
+                        _apply_picker_to_row()
+                    elif not pr.collidepoint(lpos):
+                        # click outside → close picker
+                        _apply_picker_to_row(); picker_for = None
+                    continue
+
+                # deactivate text inputs
+                for i in range(len(rows)): row_active[i] = False
+                anim_active = False
+
+                if save_btn.collidepoint(lpos): commit()
+                elif back_btn.collidepoint(lpos): running = False
+                else:
+                    # swatch → open picker
+                    for i in range(len(rows)):
+                        if swatch_rect(i).collidepoint(lpos):
+                            _open_picker(i); break
+                    else:
+                        # hex input
+                        for i in range(len(rows)):
+                            if input_rect(i).collidepoint(lpos):
+                                row_active[i] = True; break
+                        if anim_input.collidepoint(lpos):
+                            anim_active = True
+                        # slider
+                        knob_x = sims_knob_x()
+                        if abs(lpos[0] - knob_x) <= 12 and abs(lpos[1] - sims_track.centery) <= 14:
+                            dragging_slider = True
+                        elif sims_track.collidepoint(lpos):
+                            sims_val = x_to_sims(lpos[0])
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if picker_for is not None:
+                    drag_sv = False; drag_hue = False
+                dragging_slider = False
+
+            elif event.type == pygame.MOUSEMOTION:
+                lpos = logical_mouse(event.pos, screen.get_size())
+                if picker_for is not None:
+                    if drag_sv:
+                        sv = _sv_rect()
+                        picker_s = max(0.0,min(1.0,(lpos[0]-sv.x)/(SV_SIZE-1)))
+                        picker_v = max(0.0,min(1.0,1-(lpos[1]-sv.y)/(SV_SIZE-1)))
+                        _apply_picker_to_row()
+                    elif drag_hue:
+                        hr = _hue_rect()
+                        picker_h = max(0.0,min(360.0,(lpos[0]-hr.x)/(SV_SIZE-1)*360))
+                        _apply_picker_to_row()
+                if dragging_slider:
+                    sims_val = x_to_sims(lpos[0])
+
+        # ── draw ─────────────────────────────────────────────────────────
+        logical.fill(_BG)
+
+        # title
+        title_s = title_font.render("Settings", True, (235, 235, 235))
+        logical.blit(title_s, (cx - title_s.get_width()//2, 30))
+        sub_s = font.render("Changes take effect immediately · Save to persist across sessions",
+                            True, _HINT_COL)
+        logical.blit(sub_s, (cx - sub_s.get_width()//2, 88))
+
+        # section divider line
+        pygame.draw.line(logical, (50,55,68), (PAD, 118), (WINDOW_W-PAD, 118))
+
+        # ── colour rows ───────────────────────────────────────────────────
+        sec = font.render("HIGHLIGHT COLORS", True, (90,95,115))
+        logical.blit(sec, (PAD, 126))
+
+        for i, (key, label, _) in enumerate(rows):
+            y = row_y(i)
+            # subtle card bg
+            pygame.draw.rect(logical, _CARD_BG,
+                             pygame.Rect(PAD, y+4, WINDOW_W-2*PAD, ROW_H-6), border_radius=7)
+
+            # label – constrained to left column
+            lbl = big_font.render(label, True, _LABEL_COL)
+            logical.blit(lbl, (PAD+12, y + (ROW_H-lbl.get_height())//2))
+
+            # swatch
+            sr = swatch_rect(i)
+            parsed = _hex_to_rgba(row_hex[i], 255)
+            sc = parsed[:3] if parsed else (80,80,80)
+            pygame.draw.rect(logical, sc, sr, border_radius=5)
+            hov_sw = sr.collidepoint(mpos)
+            border_sw = (200,220,255) if hov_sw else (85,90,105)
+            pygame.draw.rect(logical, border_sw, sr, width=2, border_radius=5)
+            # small "edit" hint on hover
+            if hov_sw:
+                tip = font.render("pick", True, (170,180,210))
+                logical.blit(tip, (sr.x, sr.bottom+2))
+
+            # hex input
+            ir = input_rect(i)
+            border_c = (120,200,255) if row_active[i] else \
+                       ((220,90,90) if not row_valid[i] else (65,70,85))
+            pygame.draw.rect(logical, _INPUT_BG, ir, border_radius=6)
+            pygame.draw.rect(logical, border_c, ir, width=2, border_radius=6)
+            txt = font.render(row_hex[i] + ("|" if row_active[i] else ""), True, (230,230,230))
+            logical.blit(txt, (ir.x+8, ir.centery - txt.get_height()//2))
+
+        # ── extra rows divider ────────────────────────────────────────────
+        div_y = row_y(len(rows)) + 6
+        pygame.draw.line(logical, (50,55,68), (PAD, div_y), (WINDOW_W-PAD, div_y))
+
+        # ── Animation speed ───────────────────────────────────────────────
+        sec2 = font.render("ANIMATION & MODEL THINK TIME", True, (90,95,115))
+        logical.blit(sec2, (PAD, div_y + 6))
+
+        pygame.draw.rect(logical, _CARD_BG,
+                         pygame.Rect(PAD, anim_y+4, WINDOW_W-2*PAD, ROW_H-6), border_radius=7)
+        anim_lbl = big_font.render("Move animation (ms)", True, _LABEL_COL)
+        logical.blit(anim_lbl, (PAD+12, anim_y + (ROW_H-anim_lbl.get_height())//2))
+        hint_a = font.render("0 = instant", True, _HINT_COL)
+        logical.blit(hint_a, (COL_SPLIT + INPUT_W + 16, anim_y + (ROW_H-hint_a.get_height())//2))
+
+        ai = anim_input
+        ab = (120,200,255) if anim_active else ((220,90,90) if not anim_valid else (65,70,85))
+        pygame.draw.rect(logical, _INPUT_BG, ai, border_radius=6)
+        pygame.draw.rect(logical, ab, ai, width=2, border_radius=6)
+        at = font.render(anim_text + ("|" if anim_active else ""), True, (230,230,230))
+        logical.blit(at, (ai.x+8, ai.centery - at.get_height()//2))
+
+        # ── Model Think Time slider ───────────────────────────────────────
+        pygame.draw.rect(logical, _CARD_BG,
+                         pygame.Rect(PAD, sims_y+4, WINDOW_W-2*PAD, ROW_H-6), border_radius=7)
+        sim_lbl = big_font.render("Model Think Time", True, _LABEL_COL)
+        logical.blit(sim_lbl, (PAD+12, sims_y + (ROW_H-sim_lbl.get_height())//2))
+
+        # track
+        pygame.draw.rect(logical, (55,60,75), sims_track, border_radius=4)
+        # filled portion
+        fill_w = sims_knob_x() - sims_track.x
+        if fill_w > 0:
+            pygame.draw.rect(logical, (70,130,210),
+                             pygame.Rect(sims_track.x, sims_track.y, fill_w, SLIDER_H),
+                             border_radius=4)
+        # knob
+        kx = sims_knob_x()
+        ky = sims_track.centery
+        pygame.draw.circle(logical, (100,160,240), (kx, ky), 9)
+        pygame.draw.circle(logical, (180,210,255), (kx, ky), 9, 2)
+
+        # End labels: "Instant" on the left, "2 seconds" on the right of the track
+        lbl_instant = font.render("Instant", True, _HINT_COL)
+        lbl_2sec    = font.render("2 seconds", True, _HINT_COL)
+        lbl_y = ky - lbl_instant.get_height() // 2
+        logical.blit(lbl_instant, (sims_track.x, lbl_y - 18))
+        logical.blit(lbl_2sec,    (sims_track.right - lbl_2sec.get_width(), lbl_y - 18))
+
+        # Current value centered below the track
+        think_secs = sims_val / 1000.0
+        if think_secs < 0.5:
+            think_str = f"{int(think_secs * 1000)} ms"
+        else:
+            think_str = f"{think_secs:.1f}s".rstrip("0").rstrip(".")
+            if not think_str.endswith("s"):
+                think_str += "s"
+        sv_lbl = font.render(think_str, True, (180,195,225))
+        logical.blit(sv_lbl, (kx - sv_lbl.get_width() // 2, ky + 14))
+
+        # ── buttons ───────────────────────────────────────────────────────
+        pygame.draw.line(logical, (50,55,68),
+                         (PAD, WINDOW_H-76), (WINDOW_W-PAD, WINDOW_H-76))
+        for rect, label, accent in ((back_btn,"← Back",False),(save_btn,"Save Settings",True)):
+            hov = rect.collidepoint(mpos)
+            bg  = (75,135,215) if accent else (50,55,68)
+            if hov: bg = tuple(min(255,c+20) for c in bg)
+            pygame.draw.rect(logical, bg, rect, border_radius=8)
+            pygame.draw.rect(logical, (100,140,220) if accent else (75,82,100),
+                             rect, width=1, border_radius=8)
+            s = big_font.render(label, True, (240,240,240))
+            logical.blit(s, s.get_rect(center=rect.center))
+
+        if status_msg:
+            sm = font.render(status_msg, True, status_color)
+            logical.blit(sm, (cx - sm.get_width()//2, save_btn.top - 26))
+
+        # picker overlay (drawn last so it's on top)
+        if picker_for is not None:
+            _draw_picker(logical)
+
+        blit_letterboxed(logical, screen)
+        pygame.display.flip()
+        clock.tick(60)
 
 
 def main():
@@ -2016,6 +2623,10 @@ def main():
                         help="Target non-king piece count for endgame positions (default 8). "
                              "Lower = simpler endgame.")
     args = parser.parse_args()
+    # Override --sims default with saved setting if the user hasn't explicitly
+    # passed --sims on the command line (sys.argv check) and a saved value exists.
+    if "--sims" not in sys.argv:
+        args.sims = int(_CFG.get("sims", args.sims))
 
     train.setup_logging()
     device = torch.device(args.device)
@@ -2044,7 +2655,8 @@ def main():
     pygame.init()
     pygame.mixer.init()
     pygame.display.set_caption("Chess vs Model")
-    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE | pygame.SCALED)
+    screen  = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
+    logical = pygame.Surface((WINDOW_W, WINDOW_H))   # fixed-res canvas; everything draws here
     clock = pygame.time.Clock()
     font       = pygame.font.SysFont("arial", 18)
     big_font   = pygame.font.SysFont("arial", 26, bold=True)
@@ -2064,38 +2676,38 @@ def main():
 
     home_buttons = [
         {
-            "label":    "Play Normal Game",
+            "label":    "Play as White",
             "sublabel": "Start from the opening position",
             "rect":     pygame.Rect(btn_x, btn_y_start, _HOME_BTN_W, _HOME_BTN_H),
             "accent":   True,
             "mode":     "normal",
         },
         {
-            "label":    "Set Up Position",
-            "sublabel": "Drag pieces to any square, then start vs model",
+            "label":    "Play as Black",
+            "sublabel": "Model plays first",
             "rect":     pygame.Rect(btn_x,
                                     btn_y_start + (_HOME_BTN_H + _HOME_BTN_GAP),
+                                    _HOME_BTN_W, _HOME_BTN_H),
+            "accent":   False,
+            "mode":     "normal_black",
+        },
+        {
+            "label":    "Set Up Position",
+            "sublabel": "Drag pieces to any square, then play",
+            "rect":     pygame.Rect(btn_x,
+                                    btn_y_start + 2 * (_HOME_BTN_H + _HOME_BTN_GAP),
                                     _HOME_BTN_W, _HOME_BTN_H),
             "accent":   False,
             "mode":     "setup",
         },
         {
-            "label":    "Play Endgame (as White)",
-            "sublabel": "Two bots simplify to an endgame, you play White",
-            "rect":     pygame.Rect(btn_x,
-                                    btn_y_start + 2 * (_HOME_BTN_H + _HOME_BTN_GAP),
-                                    _HOME_BTN_W, _HOME_BTN_H),
-            "accent":   False,
-            "mode":     "endgame_white",
-        },
-        {
-            "label":    "Play Endgame (as Black)",
-            "sublabel": "Two bots simplify to an endgame, you play Black",
+            "label":    "Settings",
+            "sublabel": "Colors, animation speed",
             "rect":     pygame.Rect(btn_x,
                                     btn_y_start + 3 * (_HOME_BTN_H + _HOME_BTN_GAP),
                                     _HOME_BTN_W, _HOME_BTN_H),
             "accent":   False,
-            "mode":     "endgame_black",
+            "mode":     "settings",
         },
     ]
 
@@ -2105,19 +2717,13 @@ def main():
     try:
         in_outer = True
         while in_outer:
-            # Reset per-session state each time we return to home
             chosen_mode = None
-            loading     = False
-            endgame_fen = None
-            gen_thread  = None
-            gen_result  = [None]
-            gen_error   = [None]
-            home_error  = None  # message banner shown on the home screen
+            home_error  = None
 
             # ── Home screen ──────────────────────────────────────────
             in_home = True
             while in_home:
-                mouse_pos = pygame.mouse.get_pos()
+                mouse_pos = logical_mouse(pygame.mouse.get_pos(), screen.get_size())
                 hovered   = None
                 for i, btn in enumerate(home_buttons):
                     if btn["rect"].collidepoint(mouse_pos):
@@ -2128,81 +2734,53 @@ def main():
                         pygame.quit()
                         train.shutdown_engine(proc)
                         return
+                    elif event.type == pygame.VIDEORESIZE:
+                        screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
                     elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
                         pygame.quit()
                         train.shutdown_engine(proc)
                         return
                     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                        if not loading:
-                            for btn in home_buttons:
-                                if btn["rect"].collidepoint(event.pos):
-                                    chosen_mode = btn["mode"]
-                                    if chosen_mode in ("endgame_white", "endgame_black"):
-                                        loading = True
-                                        home_error = None
-                                        def _gen(result_box, error_box, sf_dir, n_pieces):
-                                            try:
-                                                result_box[0] = generate_endgame_position(
-                                                    stockfish_dir=sf_dir,
-                                                    target_pieces=n_pieces,
-                                                    movetime_ms=50,
-                                                )
-                                            except Exception as e:
-                                                error_box[0] = str(e)
-                                        gen_thread = threading.Thread(
-                                            target=_gen,
-                                            args=(gen_result, gen_error, args.stockfish_dir,
-                                                  args.endgame_pieces),
-                                            daemon=True,
-                                        )
-                                        gen_thread.start()
-                                    else:
-                                        in_home = False
-                                    break
+                        lpos = logical_mouse(event.pos, screen.get_size())
+                        for btn in home_buttons:
+                            if btn["rect"].collidepoint(lpos):
+                                chosen_mode = btn["mode"]
+                                in_home = False
+                                break
 
-                if loading and gen_thread is not None and not gen_thread.is_alive():
-                    loading = False
-                    if gen_error[0] is not None:
-                        # Generation failed -- stay on the home screen and
-                        # show why, instead of silently falling through to
-                        # a normal game (which used to look identical to a
-                        # successful endgame setup from the player's side).
-                        home_error = f"Endgame generation failed: {gen_error[0]}"
-                        chosen_mode = None
-                    else:
-                        endgame_fen = gen_result[0]
-                        in_home     = False
-
-                draw_home_screen(screen, font, big_font, title_font,
-                                 home_buttons, hovered, loading=loading,
-                                 error_text=home_error)
+                draw_home_screen(logical, font, big_font, title_font,
+                                 home_buttons, hovered, error_text=home_error)
+                blit_letterboxed(logical, screen)
                 pygame.display.flip()
                 clock.tick(60)
+
+            # ── Settings screen ──────────────────────────────────────
+            if chosen_mode == "settings":
+                _run_settings_screen(screen, logical, clock, font, big_font, title_font, args)
+                continue   # back to home
 
             # ── Set Up Position mode ─────────────────────────────────
             setup_fen = None
             if chosen_mode == "setup":
                 setup_fen = _run_setup_screen(
-                    screen, clock, font, big_font, title_font,
+                    screen, logical, clock, font, big_font, title_font,
                     images, sounds, board_backgrounds, args,
                 )
                 if setup_fen is None:
-                    # User quit during setup — go back to home
-                    continue
+                    continue   # user quit setup — back to home
 
             # ── Determine start FEN and color ────────────────────────
-            if chosen_mode == "setup":
-                start_fen = setup_fen
-            else:
-                start_fen = endgame_fen  # None for normal game
+            start_fen = setup_fen  # None for normal game
 
-            if chosen_mode == "endgame_white":
-                args.color = "white"
-            elif chosen_mode == "endgame_black":
+            if chosen_mode == "normal_black":
                 args.color = "black"
+            elif chosen_mode in ("normal", "setup"):
+                if chosen_mode == "normal":
+                    args.color = "white"
+                # setup keeps whatever color try_start set
 
             # ── Build game and run game loop ─────────────────────────
-            game = Game(args, screen, font, big_font, eval_font,
+            game = Game(args, screen, logical, font, big_font, eval_font,
                         images, sounds, board_backgrounds, proc)
 
             if start_fen is not None:
@@ -2214,14 +2792,20 @@ def main():
                     if event.type == pygame.QUIT:
                         game_running = False
                         in_outer = False
+                    elif event.type == pygame.VIDEORESIZE:
+                        screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+                        game.screen = screen
                     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                        game.handle_mousedown(event.pos)
+                        lpos = logical_mouse(event.pos, screen.get_size())
+                        game.handle_mousedown(lpos)
                     elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                        game.handle_mouseup(event.pos)
+                        lpos = logical_mouse(event.pos, screen.get_size())
+                        game.handle_mouseup(lpos)
                     elif event.type == pygame.MOUSEWHEEL:
+                        lmx = logical_mouse(pygame.mouse.get_pos(), screen.get_size())[0]
                         if game.show_analysis:
                             game.scroll_analysis(event.y)
-                        elif pygame.mouse.get_pos()[0] >= SIDEBAR_X:
+                        elif lmx >= SIDEBAR_X:
                             game.scroll_moves(event.y)
                     elif event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_q:
@@ -2240,7 +2824,7 @@ def main():
                     game_running = False   # break back to outer home loop
 
                 game.poll_model_move()
-                game.draw_frame()
+                game.draw_frame()   # smoothscale onto screen is done inside draw_frame
                 pygame.display.flip()
                 clock.tick(60)
 
