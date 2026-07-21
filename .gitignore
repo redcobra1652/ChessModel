@@ -37,7 +37,7 @@ warm_train/*.pgn
 *.ckpt
 # … EXCEPT the two canonical best-model files that are worth tracking.
 !best_model.pt
-!best_model_stockfish_train.pt
+!best_model_6x64_1920.pt
 
 # ── Compiled C++ engine binary ─────────────────────────────────────────────────
 mcts_engine

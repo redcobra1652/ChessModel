@@ -373,13 +373,29 @@ def find_immediate_mate(board: chess.Board):
 def position_outcome(board: chess.Board):
     """Returns (terminal, result) where result is from the perspective of
     the side to move at `board` (+1 win / -1 loss / 0 draw), following
-    the standard AlphaZero value-head sign convention."""
-    outcome = board.outcome(claim_draw=True)
-    if outcome is None:
-        return False, 0.0
-    if outcome.winner is None:
+    the standard AlphaZero value-head sign convention.
+
+    Uses claim_draw=False for the base outcome check, then explicitly
+    checks is_repetition(3) and can_claim_fifty_moves() to detect draws.
+    This avoids the python-chess can_claim_threefold_repetition() lookahead
+    bug where the game is declared a draw one move early because *some*
+    legal move would cause a third repetition -- even when the current
+    position has only repeated twice. We only declare a draw when the
+    position has actually repeated three times already.
+    """
+    # Check non-draw terminals first (checkmate, stalemate, insufficient
+    # material, 75-move rule, fivefold repetition) without claim_draw so
+    # we don't trigger the lookahead behaviour.
+    outcome = board.outcome(claim_draw=False)
+    if outcome is not None:
+        if outcome.winner is None:
+            return True, 0.0
+        return True, (1.0 if outcome.winner == board.turn else -1.0)
+    # Now check claimable draws strictly: only if the position has ACTUALLY
+    # repeated three times already, or the fifty-move rule is already met.
+    if board.is_repetition(3) or board.can_claim_fifty_moves():
         return True, 0.0
-    return True, (1.0 if outcome.winner == board.turn else -1.0)
+    return False, 0.0
 
 
 # ----------------------------------------------------------------------
@@ -798,7 +814,7 @@ def play_one_game(proc, sims: int, threads: int, max_moves: int, temp_moves: int
     examples = []
     ply = 0
 
-    while not board.is_game_over(claim_draw=True) and ply < max_moves:
+    while not board.is_game_over(claim_draw=False) and not board.is_repetition(3) and not board.can_claim_fifty_moves() and ply < max_moves:
         # --- Mate-in-1 safety net: checked before trusting MCTS at all ---
         # Regardless of what the network/search currently think, if a
         # legal move mates right now, play it -- full stop. This also
@@ -929,12 +945,12 @@ def tournament(proc, model_a, model_b, n_games: int, sims: int, threads: int,
         # (and candidate vs. best, which start out nearly identical) don't
         # all collapse into the exact same deterministic line.
         for _ in range(OPENING_RANDOM_PLIES):
-            if board.is_game_over(claim_draw=True):
+            if board.is_game_over(claim_draw=False) or board.is_repetition(3) or board.can_claim_fifty_moves():
                 break
             board.push(random.choice(list(board.legal_moves)))
             ply += 1
 
-        while not board.is_game_over(claim_draw=True) and ply < max_moves:
+        while not board.is_game_over(claim_draw=False) and not board.is_repetition(3) and not board.can_claim_fifty_moves() and ply < max_moves:
             # Same mate-in-1 safety net as self-play: never let search
             # second-guess a move that just ends the game outright.
             mate_move = find_immediate_mate(board)

@@ -260,7 +260,7 @@ def play_one_imitation_game(sf_teacher, sf_white, sf_black, opponent_limit, teac
     if eval_blend > 0.0:
         eval_limit = make_limit(eval_movetime_ms, eval_depth)
 
-    while not board.is_game_over(claim_draw=True) and ply < max_moves:
+    while not board.is_game_over(claim_draw=False) and not board.is_repetition(3) and not board.can_claim_fifty_moves() and ply < max_moves:
         side_to_move = board.turn  # capture BEFORE any mutation of `board`
 
         # --- Teacher annotation happens on every ply, regardless of who
@@ -376,7 +376,7 @@ def play_one_eval_game(mcts_proc, sf_engine, model, device, sims, threads, max_m
     board = chess.Board()
     ply = 0
     model_records = []  # (fen_before, move_uci) for each model move
-    while not board.is_game_over(claim_draw=True) and ply < max_moves:
+    while not board.is_game_over(claim_draw=False) and not board.is_repetition(3) and not board.can_claim_fifty_moves() and ply < max_moves:
         if board.turn == model_color:
             mate_move = train.find_immediate_mate(board)
             if mate_move is not None:
