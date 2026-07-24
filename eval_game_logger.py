@@ -35,7 +35,7 @@ def play_one_eval_game_pgn(mcts_proc, sf_engine, model, device, sims, threads,
     game.headers["Black"] = "Stockfish" if model_is_white else "Model"
     node = game
 
-    while not board.is_game_over(claim_draw=True) and ply < max_moves:
+    while not board.is_game_over(claim_draw=False) and not board.is_repetition(3) and not board.can_claim_fifty_moves() and ply < max_moves:
         if board.turn == model_color:
             mate_move = train.find_immediate_mate(board)
             comment = None
@@ -62,12 +62,16 @@ def play_one_eval_game_pgn(mcts_proc, sf_engine, model, device, sims, threads,
     terminal, result_for_mover = train.position_outcome(board)
     if not terminal or result_for_mover == 0.0:
         outcome = "draw"
+        # Annotate the final node with why the game ended as a draw.
+        draw_reason = _draw_reason(board, ply, max_moves)
+        if node != game:
+            node.comment = (node.comment + "  " if node.comment else "") + draw_reason
     else:
         winner_is_white = (result_for_mover == 1.0) == (board.turn == chess.WHITE)
         model_won = winner_is_white == model_is_white
         outcome = "win" if model_won else "loss"
 
-    game.headers["Result"] = board.result(claim_draw=True)
+    game.headers["Result"] = board.result(claim_draw=False)
     game.headers["ModelColor"] = "White" if model_is_white else "Black"
     game.headers["Outcome"] = outcome  # from the model's perspective
     game.headers["Plies"] = str(ply)
@@ -134,6 +138,28 @@ def run_eval_batch_with_pgn(mcts_proc, sf_engine, model, device, sims, threads,
 
     return {"wins": wins, "losses": losses, "draws": draws, "total": total, "score": score,
             "corrective_examples": all_corrective}
+
+
+def _draw_reason(board: chess.Board, ply: int, max_moves: int) -> str:
+    """Returns a human-readable string explaining why the game ended as a draw."""
+    outcome = board.outcome(claim_draw=False)
+    if outcome is not None and outcome.winner is None:
+        if outcome.termination == chess.Termination.STALEMATE:
+            return "draw: stalemate"
+        if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+            return "draw: fivefold repetition (mandatory)"
+        if outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
+            return "draw: 75-move rule (mandatory)"
+        if outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
+            return "draw: insufficient material"
+        return f"draw: {outcome.termination.name.lower()}"
+    if board.is_repetition(3):
+        return "draw: threefold repetition"
+    if board.can_claim_fifty_moves():
+        return "draw: 50-move rule"
+    if ply >= max_moves:
+        return f"draw: max_moves limit ({max_moves}) reached"
+    return "draw: unknown reason"
 
 
 def _stratified_sample(games_by_outcome, sample_size, rng):

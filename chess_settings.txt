@@ -18,5 +18,5 @@
     150
   ],
   "anim_duration_ms": 175,
-  "sims": 1900
+  "sims": 1000
 }

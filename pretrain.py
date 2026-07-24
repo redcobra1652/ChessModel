@@ -484,7 +484,8 @@ def main():
 
     model = train.DualHeadResNet().to(device)
     if args.init_from:
-        model.load_state_dict(torch.load(args.init_from, map_location=device))
+        ckpt = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         logger.info(f"Continuing pretraining from {args.init_from}.")
     else:
         logger.info("Starting from a fresh random init.")

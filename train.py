@@ -277,7 +277,7 @@ class DualHeadResNet(nn.Module):
     Output: policy logits (N, ACTION_SIZE); value (N, 1) in [-1, 1] via tanh.
     """
 
-    def __init__(self, in_channels: int = 13, channels: int = 64, n_blocks: int = 6,
+    def __init__(self, in_channels: int = 13, channels: int = 128, n_blocks: int = 10,
                  action_size: int = ACTION_SIZE):
         super().__init__()
         self.conv_in = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
